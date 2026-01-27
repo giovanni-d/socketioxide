@@ -105,6 +105,11 @@ impl<A: Adapter> AckSender<A> {
         Self { socket, ack_id }
     }
 
+    /// Returns `true` if the client is expecting an ack response.
+    pub fn has_ack(&self) -> bool {
+        self.ack_id.is_some()
+    }
+
     /// Send the ack response to the client.
     pub fn send<T: Serialize + ?Sized>(self, data: &T) -> Result<(), SendError> {
         use crate::socket::PermitExt;
