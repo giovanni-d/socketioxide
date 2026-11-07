@@ -1,0 +1,1296 @@
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+//! # A PostgreSQL adapter implementation for the socketioxide crate.
+//! The adapter is used to communicate with other nodes of the same application.
+//! This allows to broadcast messages to sockets connected on other servers,
+//! to get the list of rooms, to add or remove sockets from rooms, etc.
+//!
+//! To achieve this, the adapter uses [LISTEN/NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)
+//! through PostgreSQL to communicate with other servers.
+//!
+//! The [`Driver`] abstraction allows the use of any PostgreSQL client.
+//! One implementation is provided:
+//! * [`SqlxDriver`](crate::drivers::sqlx::SqlxDriver) for the [`sqlx`] crate.
+//!
+//! You can also implement your own driver by implementing the [`Driver`] trait.
+//!
+//! <div class="warning">
+//!     Socketioxide-postgres is not compatible with <code>@socketio/postgres-adapter</code>.
+//!     They use completely different protocols and cannot be used together.
+//!     Do not mix socket.io JS servers with socketioxide rust servers.
+//! </div>
+//!
+//! ## How does it work?
+//!
+//! The [`PostgresAdapterCtr`] is a constructor for the [`SqlxAdapter`] which is an implementation of
+//! the [`Adapter`](https://docs.rs/socketioxide/latest/socketioxide/adapter/trait.Adapter.html) trait.
+//!
+//! Then, for each namespace, an adapter is created and it takes a corresponding [`CoreLocalAdapter`].
+//! The [`CoreLocalAdapter`] allows to manage the local rooms and local sockets. The default `LocalAdapter`
+//! is simply a wrapper around this [`CoreLocalAdapter`].
+//!
+//! Once it is created the adapter is initialized with the [`CustomPostgresAdapter::init`] method.
+//! It will subscribe to three PostgreSQL NOTIFY channels and emit heartbeats.
+//! Classic messages are encoded with JSON and binary messages encoded with msgpack and
+//! deffered to the postgres attachment table.
+//!
+//! There are 7 types of requests:
+//! * Broadcast a packet to all the matching sockets.
+//! * Broadcast a packet to all the matching sockets and wait for a stream of acks.
+//! * Disconnect matching sockets.
+//! * Get all the rooms.
+//! * Add matching sockets to rooms.
+//! * Remove matching sockets from rooms.
+//! * Fetch all the remote sockets matching the options.
+//! * Heartbeat
+//! * Initial heartbeat. When receiving an initial heartbeat all other servers reply a heartbeat immediately.
+//!
+//! For ack streams, the adapter will first send a `BroadcastAckCount` response to the server that sent the request,
+//! and then send the acks as they are received (more details in [`CustomPostgresAdapter::broadcast_with_ack`] fn).
+//!
+//! On the other side, each time an action has to be performed on the local server, the adapter will
+//! first broadcast a request to all the servers and then perform the action locally.
+
+use drivers::Driver;
+use futures_core::{Stream, stream::BoxStream};
+use futures_util::{StreamExt, future::Either, pin_mut};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
+use socketioxide_core::{
+    Sid, Uid,
+    adapter::{
+        BroadcastOptions, CoreAdapter, CoreLocalAdapter, DefinedAdapter, RemoteSocketData, Room,
+        RoomParam, SocketEmitter, Spawnable,
+        errors::{AdapterError, BroadcastError},
+        heartbeat::{HeartbeatSender, HeartbeatTracker, heartbeat_loop},
+        remote_packet::{
+            RequestIn, RequestOut, RequestTypeIn, RequestTypeOut, Response, ResponseTypeId,
+        },
+        request::RemoteRequestHandler,
+        stream::{
+            AckStream, ChanStream, DropStream, ResponseHandlers, insert_response_handler,
+            wait_responses,
+        },
+    },
+    packet::Packet,
+};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt, future,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{sync::mpsc, task::AbortHandle};
+
+use crate::{drivers::Notification, stream::AckPayload};
+
+pub mod drivers;
+mod stream;
+
+/// The configuration of the [`CustomPostgresAdapter`].
+#[derive(Debug, Clone)]
+pub struct PostgresAdapterConfig {
+    /// The heartbeat timeout duration. If a remote node does not respond within this duration,
+    /// it will be considered disconnected. Default is 60 seconds.
+    pub hb_timeout: Duration,
+
+    /// The heartbeat interval duration. The current node will broadcast a heartbeat to the
+    /// remote nodes at this interval. Default is 10 seconds.
+    pub hb_interval: Duration,
+
+    /// The request timeout. When expecting a response from remote nodes, if they do not respond within
+    /// this duration, the request will be considered failed. Default is 5 seconds.
+    pub request_timeout: Duration,
+
+    /// The channel size used to receive ack responses. Default is 255.
+    ///
+    /// If you have a lot of servers/sockets and that you may miss acknowledgement because they arrive faster
+    /// than you poll them with the returned stream, you might want to increase this value.
+    pub ack_response_buffer: usize,
+
+    /// The table name used to store socket.io attachments. Default is "socket_io_attachments".
+    ///
+    /// > The table name must be a sanitized string. Do not use special characters or spaces.
+    pub table_name: Cow<'static, str>,
+
+    /// The prefix used for the channels. Default is "socket.io".
+    pub prefix: Cow<'static, str>,
+
+    /// The threshold from which the payload size in bytes is considered large and should be passed through the
+    /// attachment table. It should match the configured value on your PostgreSQL instance:
+    /// <https://www.postgresql.org/docs/current/sql-notify.html>. By default it is 8KB (8000 bytes).
+    pub payload_threshold: usize,
+
+    /// The duration between cleanup queries on the attachment table.
+    pub cleanup_interval: Duration,
+
+    /// The maximum number of concurrent attachment fetches in-flight on the notification
+    /// event pipeline. Default is 64.
+    ///
+    /// Incoming NOTIFY messages are processed through `.map().buffered(n).for_each()` so that
+    /// [`recv_req`](CustomPostgresAdapter) is always called in wire order, while attachment DB
+    /// round-trips overlap up to this bound. Raising it improves throughput under bursts of
+    /// large payloads at the cost of more in-flight memory; lowering it tightens back-pressure
+    /// on the LISTEN/NOTIFY pipeline. Because `buffered` preserves input order, a single slow
+    /// attachment stalls every subsequent request until it resolves — so keep this comfortably
+    /// above the typical burst size.
+    pub ev_buffer_size: usize,
+}
+
+impl PostgresAdapterConfig {
+    /// Create a new [`PostgresAdapterConfig`] with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The heartbeat timeout duration. If a remote node does not respond within this duration,
+    /// it will be considered disconnected. Default is 60 seconds.
+    pub fn with_hb_timeout(mut self, hb_timeout: Duration) -> Self {
+        self.hb_timeout = hb_timeout;
+        self
+    }
+
+    /// The heartbeat interval duration. The current node will broadcast a heartbeat to the
+    /// remote nodes at this interval. Default is 10 seconds.
+    pub fn with_hb_interval(mut self, hb_interval: Duration) -> Self {
+        self.hb_interval = hb_interval;
+        self
+    }
+
+    /// The request timeout. When expecting a response from remote nodes, if they do not respond within
+    /// this duration, the request will be considered failed. Default is 5 seconds.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// The channel size used to receive ack responses. Default is 255.
+    ///
+    /// If you have a lot of servers/sockets and that you may miss acknowledgement because they arrive faster
+    /// than you poll them with the returned stream, you might want to increase this value.
+    pub fn with_ack_response_buffer(mut self, ack_response_buffer: usize) -> Self {
+        self.ack_response_buffer = ack_response_buffer;
+        self
+    }
+
+    /// The table name used to store socket.io attachments. Default is "socket_io_attachments".
+    ///
+    /// > The table name must be a sanitized string. Do not use special characters or spaces.
+    pub fn with_table_name(mut self, table_name: impl Into<Cow<'static, str>>) -> Self {
+        self.table_name = table_name.into();
+        self
+    }
+
+    /// The prefix used for the channels. Default is "socket.io".
+    pub fn with_prefix(mut self, prefix: impl Into<Cow<'static, str>>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// The threshold to the payload size in bytes. It should match the configured value on your PostgreSQL instance:
+    /// <https://www.postgresql.org/docs/current/sql-notify.html>. By default it is 8KB (8000 bytes).
+    pub fn with_payload_threshold(mut self, payload_threshold: usize) -> Self {
+        self.payload_threshold = payload_threshold;
+        self
+    }
+
+    /// The duration between cleanup queries on the attachment table. Default is 60 seconds.
+    pub fn with_cleanup_interval(mut self, cleanup_interval: Duration) -> Self {
+        self.cleanup_interval = cleanup_interval;
+        self
+    }
+
+    /// The maximum number of concurrent attachment fetches in-flight on the notification
+    /// event pipeline. Default is 64. See [`PostgresAdapterConfig::ev_buffer_size`] for tradeoffs.
+    pub fn with_ev_buffer_size(mut self, ev_buffer_size: usize) -> Self {
+        self.ev_buffer_size = ev_buffer_size;
+        self
+    }
+}
+
+impl Default for PostgresAdapterConfig {
+    fn default() -> Self {
+        Self {
+            hb_timeout: Duration::from_secs(60),
+            hb_interval: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(5),
+            ack_response_buffer: 255,
+            table_name: "socket_io_attachments".into(),
+            prefix: "socket.io".into(),
+            payload_threshold: 8_000,
+            cleanup_interval: Duration::from_secs(60),
+            ev_buffer_size: 64,
+        }
+    }
+}
+
+/// Represent any error that might happen when using this adapter.
+#[derive(thiserror::Error)]
+pub enum Error<D: Driver> {
+    /// Postgres driver error
+    #[error("driver error: {0}")]
+    Driver(D::Error),
+    /// Json Packet encoding/decoding error
+    #[error("json packet encoding/decoding error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Binary packet encoding error
+    #[error("binary packet encoding error: {0}")]
+    MessagePackEncode(#[from] rmp_serde::encode::Error),
+    /// Binary packet decoding error
+    #[error("binary packet decoding error: {0}")]
+    MessagePackDecode(#[from] rmp_serde::decode::Error),
+}
+
+impl<R: Driver> fmt::Debug for Error<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl<R: Driver> From<Error<R>> for AdapterError {
+    fn from(err: Error<R>) -> Self {
+        AdapterError::from(Box::new(err) as Box<dyn std::error::Error + Send>)
+    }
+}
+
+/// The adapter constructor. For each namespace you define, a new adapter instance is created
+/// from this constructor.
+#[derive(Debug, Clone)]
+pub struct PostgresAdapterCtr<D: Driver> {
+    driver: D,
+    config: PostgresAdapterConfig,
+}
+
+#[cfg(feature = "sqlx")]
+impl PostgresAdapterCtr<drivers::sqlx::SqlxDriver> {
+    /// Create a new adapter constructor with the [`sqlx`](drivers::sqlx) driver
+    /// and a default config.
+    pub fn new_with_sqlx(pool: drivers::sqlx::sqlx_client::PgPool) -> Self {
+        Self::new_with_sqlx_config(pool, PostgresAdapterConfig::default())
+    }
+
+    /// Create a new adapter constructor with the [`sqlx`](drivers::sqlx) driver
+    /// and a custom config.
+    pub fn new_with_sqlx_config(
+        pool: drivers::sqlx::sqlx_client::PgPool,
+        config: PostgresAdapterConfig,
+    ) -> Self {
+        let driver = drivers::sqlx::SqlxDriver::new(pool);
+        Self { driver, config }
+    }
+}
+
+#[cfg(feature = "tokio-postgres")]
+impl PostgresAdapterCtr<drivers::tokio_postgres::TokioPostgresDriver> {
+    /// Create a new adapter constructor with the [`tokio-postgres`](drivers::tokio_postgres) driver
+    /// and a default config.
+    pub async fn new_with_tokio_postgres<T>(
+        pg_config: tokio_postgres::Config,
+        tls: T,
+    ) -> Result<Self, tokio_postgres::Error>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Send + Sync + 'static,
+        <T as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream: Send,
+    {
+        Self::new_with_tokio_postgres_config(pg_config, tls, PostgresAdapterConfig::default()).await
+    }
+
+    /// Create a new adapter constructor with the [`sqlx`](drivers::sqlx) driver
+    /// and a custom config.
+    pub async fn new_with_tokio_postgres_config<T>(
+        pg_config: tokio_postgres::Config,
+        tls: T,
+        config: PostgresAdapterConfig,
+    ) -> Result<Self, tokio_postgres::Error>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Send + Sync + 'static,
+        <T as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream: Send,
+    {
+        let driver = drivers::tokio_postgres::TokioPostgresDriver::new(pg_config, tls).await?;
+        Ok(Self { driver, config })
+    }
+}
+
+impl<D: Driver> PostgresAdapterCtr<D> {
+    /// Create a new adapter constructor with a custom postgres driver and a config.
+    ///
+    /// You can implement your own driver by implementing the [`Driver`] trait with any postgres client.
+    /// Check the [`drivers`] module for more information.
+    pub fn new_with_driver(driver: D, config: PostgresAdapterConfig) -> Self {
+        Self { driver, config }
+    }
+}
+
+/// The postgres adapter with the [`sqlx`](drivers::sqlx) driver.
+#[cfg(feature = "sqlx")]
+pub type SqlxAdapter<E> = CustomPostgresAdapter<E, drivers::sqlx::SqlxDriver>;
+
+/// The postgres adapter with the [`tokio_postgres`](drivers::tokio_postgres) driver.
+#[cfg(feature = "tokio-postgres")]
+pub type TokioPostgresAdapter<E> =
+    CustomPostgresAdapter<E, drivers::tokio_postgres::TokioPostgresDriver>;
+
+/// The postgres adapter implementation.
+/// It is generic over the [`Driver`] used to communicate with the postgres server.
+/// And over the [`SocketEmitter`] used to communicate with the local server. This allows to
+/// avoid cyclic dependencies between the adapter, `socketioxide-core` and `socketioxide` crates.
+pub struct CustomPostgresAdapter<E, D: Driver> {
+    /// The driver used by the adapter. This is used to communicate with the postgres server.
+    /// All the postgres adapter instances share the same driver.
+    driver: D,
+    /// The configuration of the adapter.
+    config: PostgresAdapterConfig,
+    /// The local adapter, used to manage local rooms and socket stores.
+    local: CoreLocalAdapter<E>,
+    /// Tracks the liveness of remote nodes based on the heartbeats they send.
+    heartbeat: HeartbeatTracker,
+    /// A map of response handlers used to await for responses from the remote servers.
+    responses: Arc<Mutex<ResponseHandlers<ResponsePayload>>>,
+
+    ev_stream_task: OnceLock<AbortHandle>,
+    hb_task: OnceLock<AbortHandle>,
+    cleanup_task: OnceLock<AbortHandle>,
+}
+
+impl<E, D: Driver> DefinedAdapter for CustomPostgresAdapter<E, D> {}
+impl<E: SocketEmitter, D: Driver> CoreAdapter<E> for CustomPostgresAdapter<E, D> {
+    type Error = Error<D>;
+    type State = PostgresAdapterCtr<D>;
+    type AckStream =
+        Either<E::AckStream, AckStream<E, BoxStream<'static, AckPayload>, ResponsePayload>>;
+    type InitRes = InitRes<D>;
+
+    fn new(state: &Self::State, local: CoreLocalAdapter<E>) -> Self {
+        Self {
+            local,
+            driver: state.driver.clone(),
+            config: state.config.clone(),
+            heartbeat: HeartbeatTracker::new(state.config.hb_timeout),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            ev_stream_task: OnceLock::new(),
+            hb_task: OnceLock::new(),
+            cleanup_task: OnceLock::new(),
+        }
+    }
+
+    fn init(self: Arc<Self>, on_success: impl FnOnce() + Send + 'static) -> Self::InitRes {
+        let fut = async move {
+            self.driver.init(&self.config.table_name).await?;
+
+            let [global_chan, node_chan, response_chan] = self.channels();
+            let channels = [
+                global_chan.as_str(),
+                node_chan.as_str(),
+                response_chan.as_str(),
+            ];
+
+            let stream = self.driver.listen(&channels).await?;
+            let ev_stream_task = tokio::spawn(self.clone().handle_ev_stream(stream)).abort_handle();
+            assert!(
+                self.ev_stream_task.set(ev_stream_task).is_ok(),
+                "Adapter::init should be called only once"
+            );
+            let hb_task =
+                tokio::spawn(heartbeat_loop(self.clone(), self.config.hb_interval)).abort_handle();
+            assert!(
+                self.hb_task.set(hb_task).is_ok(),
+                "Adapter::init should be called only once"
+            );
+            let cleanup_task = tokio::spawn(self.clone().cleanup_job()).abort_handle();
+            assert!(
+                self.cleanup_task.set(cleanup_task).is_ok(),
+                "Adapter::init should be called only once"
+            );
+
+            // Send initial heartbeat when starting.
+            self.emit_init_heartbeat().await.map_err(|e| match e {
+                Error::Driver(e) => e,
+                _ => unreachable!(),
+            })?;
+
+            on_success();
+            Ok(())
+        };
+        InitRes(Box::pin(fut))
+    }
+
+    async fn close(&self) -> Result<(), Self::Error> {
+        if let Some(hb_task) = self.hb_task.get() {
+            hb_task.abort();
+        }
+        if let Some(ev_stream_task) = self.ev_stream_task.get() {
+            ev_stream_task.abort();
+        }
+        if let Some(cleanup_task) = self.cleanup_task.get() {
+            cleanup_task.abort();
+        }
+
+        let [global_chan, node_chan, response_chan] = self.channels();
+        let channels = [
+            global_chan.as_str(),
+            node_chan.as_str(),
+            response_chan.as_str(),
+        ];
+        self.driver.close(&channels).await.map_err(Error::Driver)
+    }
+
+    /// Get the number of servers by iterating over the node liveness heartbeats.
+    async fn server_count(&self) -> Result<u16, Self::Error> {
+        Ok(self.heartbeat.server_count())
+    }
+
+    /// Broadcast a packet to all the servers to send them through their sockets.
+    async fn broadcast(
+        &self,
+        packet: Packet,
+        opts: BroadcastOptions,
+    ) -> Result<(), BroadcastError> {
+        let node_id = self.local.server_id();
+        if !opts.is_local(node_id) {
+            let req = RequestOut::new(node_id, RequestTypeOut::Broadcast(&packet), &opts);
+            self.send_req(req, None).await.map_err(AdapterError::from)?;
+        }
+
+        self.local.broadcast(packet, opts)?;
+        Ok(())
+    }
+
+    /// Broadcast a packet to all the servers to send them through their sockets.
+    ///
+    /// Returns a Stream that is a combination of the local ack stream and a remote ack stream.
+    /// Here is a specific protocol in order to know how many message the server expect to close
+    /// the stream at the right time:
+    /// * Get the number `n` of remote servers.
+    /// * Send the broadcast request.
+    /// * Expect `n` `BroadcastAckCount` response in the stream to know the number `m` of expected ack responses.
+    /// * Expect `sum(m)` broadcast counts sent by the servers.
+    ///
+    /// Example with 3 remote servers (n = 3):
+    /// ```text
+    /// +---+                   +---+                   +---+
+    /// | A |                   | B |                   | C |
+    /// +---+                   +---+                   +---+
+    ///   |                       |                       |
+    ///   |---BroadcastWithAck--->|                       |
+    ///   |---BroadcastWithAck--------------------------->|
+    ///   |                       |                       |
+    ///   |<-BroadcastAckCount(2)-|     (n = 2; m = 2)    |
+    ///   |<-BroadcastAckCount(2)-------(n = 2; m = 4)----|
+    ///   |                       |                       |
+    ///   |<----------------Ack---------------------------|
+    ///   |<----------------Ack---|                       |
+    ///   |                       |                       |
+    ///   |<----------------Ack---------------------------|
+    ///   |<----------------Ack---|                       |
+    async fn broadcast_with_ack(
+        &self,
+        packet: Packet,
+        opts: BroadcastOptions,
+        timeout: Option<Duration>,
+    ) -> Result<Self::AckStream, Self::Error> {
+        if opts.is_local(self.local.server_id()) {
+            tracing::debug!(?opts, "broadcast with ack is local");
+            let (local, _) = self.local.broadcast_with_ack(packet, opts, timeout);
+            return Ok(Either::Left(local));
+        }
+        let req = RequestOut::new(
+            self.local.server_id(),
+            RequestTypeOut::BroadcastWithAck(&packet),
+            &opts,
+        )
+        .with_ack_timeout(timeout);
+        let req_id = req.id;
+
+        let remote_serv_cnt = self.server_count().await?.saturating_sub(1);
+        tracing::trace!(?remote_serv_cnt, "expecting acks from remote servers");
+
+        let (tx, rx) = mpsc::channel(self.config.ack_response_buffer + remote_serv_cnt as usize);
+        self.responses.lock().unwrap().insert(req_id, tx);
+        // Built before sending the request, to remove the handler if the send fails or is cancelled.
+        let rx = DropStream::new(ChanStream::new(rx), self.responses.clone(), req_id);
+
+        self.send_req(req, None).await?;
+        let (local, _) = self.local.broadcast_with_ack(packet, opts, timeout);
+
+        // we wait for the configured ack timeout + the adapter request timeout
+        let timeout = self
+            .config
+            .request_timeout
+            .saturating_add(timeout.unwrap_or(self.local.ack_timeout()));
+
+        let table_name = self.config.table_name.clone();
+        let driver = self.driver.clone();
+
+        // Resolve attachment payloads concurrently while preserving the order the notifications
+        // arrived in the channel. `buffered` keeps wire order, which is required so that each
+        // server's `BroadcastAckCount` is observed before its individual acks.
+        let concurrency = std::cmp::max(self.config.ack_response_buffer, 1);
+        let remote: BoxStream<'static, AckPayload> = rx
+            .map(move |payload| resolve_ack_payload(payload, driver.clone(), table_name.clone()))
+            .buffered(concurrency)
+            .filter_map(future::ready)
+            .boxed();
+
+        Ok(Either::Right(AckStream::new(
+            local,
+            remote,
+            decode_postgres_ack,
+            timeout,
+            remote_serv_cnt,
+            req_id,
+            self.responses.clone(),
+        )))
+    }
+
+    async fn disconnect_socket(&self, opts: BroadcastOptions) -> Result<(), BroadcastError> {
+        if !opts.is_local(self.local.server_id()) {
+            let req = RequestOut::new(
+                self.local.server_id(),
+                RequestTypeOut::DisconnectSockets,
+                &opts,
+            );
+            self.send_req(req, None).await.map_err(AdapterError::from)?;
+        }
+        self.local
+            .disconnect_socket(opts)
+            .map_err(BroadcastError::Socket)?;
+
+        Ok(())
+    }
+
+    async fn rooms(&self, opts: BroadcastOptions) -> Result<Vec<Room>, Self::Error> {
+        if opts.is_local(self.local.server_id()) {
+            return Ok(self.local.rooms(opts).into_iter().collect());
+        }
+        let req = RequestOut::new(self.local.server_id(), RequestTypeOut::AllRooms, &opts);
+        let req_id = req.id;
+
+        // First get the remote stream because postgres might send
+        // the responses before subscription is done.
+        let stream = self
+            .get_res::<()>(req_id, ResponseTypeId::AllRooms, opts.server_id)
+            .await?;
+        self.send_req(req, opts.server_id).await?;
+        let local = self.local.rooms(opts);
+        let rooms = stream
+            .filter_map(|item| std::future::ready(item.into_rooms()))
+            .fold(local, |mut acc, item| async move {
+                acc.extend(item);
+                acc
+            })
+            .await;
+        Ok(Vec::from_iter(rooms))
+    }
+
+    async fn add_sockets(
+        &self,
+        opts: BroadcastOptions,
+        rooms: impl RoomParam,
+    ) -> Result<(), Self::Error> {
+        let rooms: Vec<Room> = rooms.into_room_iter().collect();
+        if !opts.is_local(self.local.server_id()) {
+            let req = RequestOut::new(
+                self.local.server_id(),
+                RequestTypeOut::AddSockets(&rooms),
+                &opts,
+            );
+            self.send_req(req, opts.server_id).await?;
+        }
+        self.local.add_sockets(opts, rooms);
+        Ok(())
+    }
+
+    async fn del_sockets(
+        &self,
+        opts: BroadcastOptions,
+        rooms: impl RoomParam,
+    ) -> Result<(), Self::Error> {
+        let rooms: Vec<Room> = rooms.into_room_iter().collect();
+        if !opts.is_local(self.local.server_id()) {
+            let req = RequestOut::new(
+                self.local.server_id(),
+                RequestTypeOut::DelSockets(&rooms),
+                &opts,
+            );
+            self.send_req(req, opts.server_id).await?;
+        }
+        self.local.del_sockets(opts, rooms);
+        Ok(())
+    }
+
+    async fn fetch_sockets(
+        &self,
+        opts: BroadcastOptions,
+    ) -> Result<Vec<RemoteSocketData>, Self::Error> {
+        if opts.is_local(self.local.server_id()) {
+            return Ok(self.local.fetch_sockets(opts));
+        }
+        let req = RequestOut::new(self.local.server_id(), RequestTypeOut::FetchSockets, &opts);
+        // First get the remote stream because postgres might send
+        // the responses before subscription is done.
+        let remote = self
+            .get_res::<RemoteSocketData>(req.id, ResponseTypeId::FetchSockets, opts.server_id)
+            .await?;
+
+        self.send_req(req, opts.server_id).await?;
+        let local = self.local.fetch_sockets(opts);
+        let sockets = remote
+            .filter_map(|item| future::ready(item.into_fetch_sockets()))
+            .fold(local, |mut acc, item| async move {
+                acc.extend(item);
+                acc
+            })
+            .await;
+        Ok(sockets)
+    }
+
+    fn get_local(&self) -> &CoreLocalAdapter<E> {
+        &self.local
+    }
+}
+
+impl<E: SocketEmitter, D: Driver> CustomPostgresAdapter<E, D> {
+    async fn cleanup_job(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(self.config.cleanup_interval);
+        interval.tick().await; // first tick yields immediately
+
+        loop {
+            interval.tick().await;
+            if let Err(err) = self
+                .driver
+                .cleanup_attachments(&self.config.table_name, self.config.cleanup_interval)
+                .await
+            {
+                tracing::warn!(%err, "failed to cleanup attachment table");
+            }
+        }
+    }
+
+    /// Drive the notification stream.
+    ///
+    /// Because `buffered` preserves input order, [`recv_req`](Self::recv_req) is always called
+    /// in the order notifications were received on the NOTIFY channel — which is the same order
+    /// the producing node issued them. This matters for causal sequences from a single producer,
+    /// e.g. `AddSockets(room)` followed by `Broadcast(room)`: without ordering, a deferred
+    /// attachment fetch for the first request could be overtaken by an inline second request,
+    /// making the broadcast miss its target.
+    ///
+    /// The tradeoff of global ordering is head-of-line blocking: a single slow attachment
+    /// fetch delays every subsequent request on this namespace, including requests from
+    /// unrelated producer nodes.
+    ///
+    /// Response notifications (`handle_res_notif`) are handled synchronously inside the `map`
+    /// closure and produce `None` so they do not participate in the buffered pipeline.
+    async fn handle_ev_stream(self: Arc<Self>, stream: impl Stream<Item = D::Notification>) {
+        let concurrency = std::cmp::max(self.config.ev_buffer_size, 1);
+        let response_chan: Arc<str> = Arc::from(self.get_response_chan(self.local.server_id()));
+        pin_mut!(stream);
+        stream
+            .map(|notif| {
+                let this = self.clone();
+                let response_chan = response_chan.clone();
+                async move {
+                    // a resolved request or None if this is was a response
+                    // that got successfully dispatched
+                    let result = if notif.channel() == &*response_chan {
+                        this.handle_res_notif(notif).map(|_| None)
+                    } else {
+                        this.resolve_req_notif(notif).await
+                    };
+
+                    result
+                        .inspect_err(|err| tracing::warn!(%err, "error handling notification"))
+                        .ok()
+                        .flatten()
+                }
+            })
+            .buffered(concurrency)
+            .filter_map(future::ready)
+            .for_each(async |req| self.recv_req(req))
+            .await;
+    }
+
+    /// Deserialize a response notification and forward it to the waiting ack-stream handler.
+    /// Synchronous: no DB round-trip, attachment resolution happens on the consumer side
+    /// (see `get_res`/`broadcast_with_ack`).
+    fn handle_res_notif(&self, notif: D::Notification) -> Result<(), Error<D>> {
+        match serde_json::from_str(notif.payload())? {
+            p if p.is_loopback(self.local.server_id()) => {
+                tracing::trace!("skipping loopback packets")
+            }
+            ResponsePacket {
+                req_id, payload, ..
+            } => {
+                let responses = self.responses.lock().unwrap();
+                let Some(tx) = responses.get(&req_id) else {
+                    tracing::debug!(%req_id, "channel not found in response map");
+                    return Ok(());
+                };
+
+                tx.try_send(payload)
+                    .inspect_err(|err| tracing::debug!("failed to send response to handler: {err}"))
+                    .ok();
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Parse a request notification into a [`RequestIn`]. Inline requests are decoded
+    /// directly; attachment-deferred requests are fetched from the attachment table. Returns
+    /// `None` for loopback packets or any recoverable error (decode, DB) — errors are logged
+    /// and the packet is skipped so a single bad notification cannot derail the pipeline.
+    async fn resolve_req_notif(
+        self: &Arc<Self>,
+        notif: D::Notification,
+    ) -> Result<Option<RequestIn>, Error<D>> {
+        let packet = serde_json::from_str::<RequestPacket<&RawValue>>(notif.payload())?;
+        if packet.is_loopback(self.local.server_id()) {
+            tracing::trace!("skipping loopback packets");
+            return Ok(None);
+        }
+        match packet {
+            RequestPacket::Request { payload, .. } => {
+                Ok(Some(serde_json::from_str::<RequestIn>(payload.get())?))
+            }
+            RequestPacket::RequestWithAttachment { id, is_binary, .. } => Ok(Some(
+                resolve_attachment(&self.driver, &self.config.table_name, id, is_binary).await?,
+            )),
+        }
+    }
+
+    /// Await for all the responses from the remote servers.
+    /// If the target node is specified, only await for the response from that node.
+    async fn get_res<T: DeserializeOwned + fmt::Debug>(
+        &self,
+        req_id: Sid,
+        response_type: ResponseTypeId,
+        target: Option<Uid>,
+    ) -> Result<impl Stream<Item = Response<T>>, Error<D>> {
+        // Check for specific target node
+        let remote_serv_cnt = if target.is_none() {
+            self.server_count().await?.saturating_sub(1) as usize
+        } else {
+            1
+        };
+
+        let rx = insert_response_handler(&self.responses, req_id, remote_serv_cnt);
+        let stream = ChanStream::new(rx);
+
+        // Overlap attachment fetches across servers while preserving arrival order so that
+        // `take(remote_serv_cnt)` still closes the stream after exactly one response per server.
+        let concurrency = std::cmp::max(remote_serv_cnt, 1);
+        let stream = stream
+            .map(async move |payload| match payload {
+                ResponsePayload::Data(data) => serde_json::from_str::<Response<T>>(data.get())
+                    .inspect_err(|err| tracing::warn!("error decoding response: {err}"))
+                    .ok(),
+                ResponsePayload::Attachment { id, is_binary } => {
+                    resolve_attachment(&self.driver, &self.config.table_name, id, is_binary)
+                        .await
+                        .inspect_err(|err| tracing::warn!("error fetching attachment: {err}"))
+                        .ok()
+                }
+            })
+            .buffered(concurrency)
+            .filter_map(future::ready);
+
+        Ok(wait_responses(
+            stream,
+            self.responses.clone(),
+            req_id,
+            response_type,
+            remote_serv_cnt,
+            self.config.request_timeout,
+        ))
+    }
+
+    // == All channels are hashed to avoid thresspassing the 63 bytes limit on postgres channel ==
+    // We cannot constraint the length of the channel name because it is generated dynamically.
+
+    /// The channels this adapter listens to.
+    fn channels(&self) -> [String; 3] {
+        let uid = self.local.server_id();
+        [
+            self.get_global_chan(),
+            self.get_node_chan(uid),
+            self.get_response_chan(uid),
+        ]
+    }
+    fn get_global_chan(&self) -> String {
+        let chan = format!("{}#{}", self.config.prefix, self.local.path());
+        hash_chan(&chan)
+    }
+    fn get_node_chan(&self, uid: Uid) -> String {
+        let chan = format!("{}{}{}", self.config.prefix, self.local.path(), uid);
+        hash_chan(&chan)
+    }
+    fn get_response_chan(&self, uid: Uid) -> String {
+        let chan = format!(
+            "response-{}{}{}",
+            self.config.prefix,
+            self.local.path(),
+            uid
+        );
+        hash_chan(&chan)
+    }
+}
+
+impl<E: SocketEmitter, D: Driver> HeartbeatSender for CustomPostgresAdapter<E, D> {
+    type Error = Error<D>;
+
+    fn uid(&self) -> Uid {
+        self.local.server_id()
+    }
+
+    /// Send a request to a specific target node or broadcast it to all nodes if no target is specified.
+    ///
+    /// The request body is serialized as JSON and wrapped in a [`RequestPacket`]. When the
+    /// serialized body exceeds [`PostgresAdapterConfig::payload_threshold`], it is stored in the
+    /// attachment table and only the row id travels over NOTIFY.
+    async fn send_req(&self, req: RequestOut<'_>, target: Option<Uid>) -> Result<(), Error<D>> {
+        tracing::trace!(?req, "sending request");
+        let chan = match target {
+            Some(target) => self.get_node_chan(target),
+            None => self.get_global_chan(),
+        };
+
+        let node_id = self.local.server_id();
+        let is_binary = req.is_binary();
+        let body = if is_binary {
+            rmp_serde::to_vec(&req)?
+        } else {
+            serde_json::to_vec(&req)?
+        };
+
+        let payload = if body.len() >= self.config.payload_threshold || is_binary {
+            let id = self
+                .driver
+                .push_attachment(&self.config.table_name, &body)
+                .await
+                .map_err(Error::Driver)?;
+
+            tracing::debug!("pushed attachment {id} for req {}", req.id);
+
+            serde_json::to_string(&RequestPacket::<()>::RequestWithAttachment {
+                node_id,
+                is_binary,
+                id,
+            })?
+        } else {
+            assert!(
+                !is_binary,
+                "binary packets should be stored in attachment table and serialized in msgpack"
+            );
+
+            let body =
+                String::from_utf8(body).expect("this should be serde_json output and valid UTF8");
+            let payload = RawValue::from_string(body)?;
+            serde_json::to_string(&RequestPacket::Request { node_id, payload })?
+        };
+
+        self.driver
+            .notify(&chan, &payload)
+            .await
+            .map_err(Error::Driver)?;
+        Ok(())
+    }
+}
+
+impl<E: SocketEmitter, D: Driver> RemoteRequestHandler<E> for CustomPostgresAdapter<E, D> {
+    type Error = Error<D>;
+
+    fn local(&self) -> &CoreLocalAdapter<E> {
+        &self.local
+    }
+
+    /// Send a response to the node that sent the request.
+    ///
+    /// When the serialized response exceeds [`PostgresAdapterConfig::payload_threshold`], it is
+    /// stored in the attachment table and only the row id travels over NOTIFY as a
+    /// [`ResponsePayload::Attachment`].
+    fn send_res<T: Serialize + fmt::Debug + Send + 'static>(
+        &self,
+        req_id: Sid,
+        req_origin: Uid,
+        res: Response<T>,
+    ) -> impl Future<Output = Result<(), Error<D>>> + Send + 'static {
+        tracing::trace!(?res, "sending response for {req_id} req to {req_origin}");
+        let driver = self.driver.clone();
+        let chan = self.get_response_chan(req_origin);
+        let table = self.config.table_name.clone();
+        let threshold = self.config.payload_threshold;
+        let node_id = self.local.server_id();
+        let is_binary = res.is_binary();
+        async move {
+            let body = if is_binary {
+                rmp_serde::to_vec(&res)?
+            } else {
+                serde_json::to_vec(&res)?
+            };
+
+            let payload = if body.len() >= threshold || is_binary {
+                let id = driver
+                    .push_attachment(&table, &body)
+                    .await
+                    .map_err(Error::Driver)?;
+                ResponsePayload::Attachment { id, is_binary }
+            } else {
+                assert!(
+                    !is_binary,
+                    "binary packets should be stored in attachment table and serialized in msgpack"
+                );
+                let body = unsafe { String::from_utf8_unchecked(body) };
+                ResponsePayload::Data(RawValue::from_string(body)?)
+            };
+
+            let message = serde_json::to_string(&ResponsePacket {
+                req_id,
+                node_id,
+                payload,
+            })?;
+
+            driver
+                .notify(&chan, &message)
+                .await
+                .map_err(Error::Driver)?;
+            Ok(())
+        }
+    }
+
+    fn recv_heartbeat(self: &Arc<Self>, req_type: RequestTypeIn, origin: Uid) {
+        HeartbeatSender::recv_heartbeat(self, &self.heartbeat, req_type, origin);
+    }
+}
+
+fn hash_chan(chan: &str) -> String {
+    let hash = xxhash_rust::xxh3::xxh3_64(chan.as_bytes());
+    format!("ch_{:x}", hash)
+}
+
+/// The result of the init future.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct InitRes<D: Driver>(futures_core::future::BoxFuture<'static, Result<(), D::Error>>);
+
+impl<D: Driver> Future for InitRes<D> {
+    type Output = Result<(), D::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+impl<D: Driver> Spawnable for InitRes<D> {
+    fn spawn(self) {
+        tokio::spawn(async move {
+            if let Err(e) = self.0.await {
+                tracing::error!("error initializing adapter: {e}");
+            }
+        });
+    }
+}
+
+/// Resolve an ack payload either from a direct notify payload
+/// or an attachment that might be JSON or MsgPack.
+async fn resolve_ack_payload<D: Driver>(
+    payload: ResponsePayload,
+    driver: D,
+    table: Cow<'static, str>,
+) -> Option<AckPayload> {
+    match payload {
+        ResponsePayload::Data(data) => Some(AckPayload::Json(data)),
+        ResponsePayload::Attachment {
+            id,
+            is_binary: false,
+        } => resolve_attachment::<Box<RawValue>, _>(&driver, &table, id, false)
+            .await
+            .map(AckPayload::Json)
+            .inspect_err(|err| tracing::warn!(%err, id, "failed to resolve payload attachment"))
+            .ok(),
+        ResponsePayload::Attachment {
+            id,
+            is_binary: true,
+        } => {
+            tracing::debug!("resolving attachment {id}");
+            driver
+                .get_attachment(&table, id)
+                .await
+                .map(AckPayload::MsgPack)
+                .inspect_err(|err| tracing::warn!(%err, id, "failed to resolve payload attachment"))
+                .ok()
+        }
+    }
+}
+
+async fn resolve_attachment<T: DeserializeOwned, D: Driver>(
+    driver: &D,
+    table_name: &str,
+    id: i64,
+    is_binary: bool,
+) -> Result<T, Error<D>> {
+    let bytes = driver
+        .get_attachment(table_name, id)
+        .await
+        .map_err(Error::Driver)?;
+    tracing::debug!("resolving attachment {id}");
+    if is_binary {
+        Ok(rmp_serde::from_slice(&bytes)?)
+    } else {
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+/// Wire-level wrapper for request NOTIFY payloads.
+///
+/// A request may either be inline (serialized request JSON) or deferred to the
+/// attachment table. The `node_id` in the deferred variant lets the receiver
+/// filter out loopback notifications before hitting the database.
+#[derive(Debug, Serialize, Deserialize)]
+enum RequestPacket<T> {
+    Request {
+        node_id: Uid,
+        payload: T,
+    },
+    RequestWithAttachment {
+        node_id: Uid,
+        is_binary: bool,
+        id: i64,
+    },
+}
+impl<T> RequestPacket<T> {
+    fn is_loopback(&self, node_id: Uid) -> bool {
+        match self {
+            RequestPacket::Request { node_id: id, .. } => *id == node_id,
+            RequestPacket::RequestWithAttachment { node_id: id, .. } => *id == node_id,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct ResponsePacket {
+    req_id: Sid,
+    node_id: Uid,
+    payload: ResponsePayload,
+}
+impl ResponsePacket {
+    fn is_loopback(&self, node_id: Uid) -> bool {
+        self.node_id == node_id
+    }
+}
+/// A response payload received from the postgres NOTIFY channel.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ResponsePayload {
+    /// An inline JSON-serialized response, used when it is smaller than
+    /// [`PostgresAdapterConfig::payload_threshold`].
+    Data(Box<RawValue>),
+    /// A reference to a response stored in the attachment table, used when it exceeds
+    /// [`PostgresAdapterConfig::payload_threshold`] or is binary.
+    Attachment {
+        /// The id of the row in the attachment table.
+        id: i64,
+        /// Whether the stored attachment is msgpack-encoded binary data.
+        is_binary: bool,
+    },
+}
+
+fn decode_postgres_ack<E: serde::de::DeserializeOwned + fmt::Debug>(
+    item: AckPayload,
+) -> Result<Response<E>, Box<dyn std::error::Error + Send>> {
+    item.deserialize()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures_core::{FusedStream, Stream};
+    use serde::{Deserialize, Serialize};
+    use socketioxide_core::{
+        Sid, Str, Uid, Value,
+        adapter::errors::SocketError,
+        adapter::{
+            BroadcastFlags, BroadcastIter, BroadcastOptions, CoreAdapter, CoreLocalAdapter,
+            RemoteSocketData, SocketEmitter,
+        },
+        packet::Packet,
+        parser::Parse,
+    };
+    use socketioxide_parser_common::CommonParser;
+
+    use super::*;
+
+    struct StubEmitter(Str);
+    struct StubAckStream;
+    impl Stream for StubAckStream {
+        type Item = (Sid, Result<Value, StubAckError>);
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+    impl FusedStream for StubAckStream {
+        fn is_terminated(&self) -> bool {
+            true
+        }
+    }
+    #[derive(Debug, Serialize, Deserialize)]
+    struct StubAckError;
+    impl fmt::Display for StubAckError {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            Ok(())
+        }
+    }
+    impl std::error::Error for StubAckError {}
+
+    impl SocketEmitter for StubEmitter {
+        type AckError = StubAckError;
+        type AckStream = StubAckStream;
+        fn get_all_sids(&self, _: impl Fn(&Sid) -> bool) -> Vec<Sid> {
+            vec![]
+        }
+        fn get_remote_sockets(&self, _: BroadcastIter<'_>) -> Vec<RemoteSocketData> {
+            vec![]
+        }
+        fn send_many(&self, _: BroadcastIter<'_>, _: Value) -> Result<(), Vec<SocketError>> {
+            Ok(())
+        }
+        fn send_many_volatile(&self, _: BroadcastIter<'_>, _: Value) {}
+        fn send_many_with_ack(
+            &self,
+            _: BroadcastIter<'_>,
+            _: Packet,
+            _: Option<Duration>,
+        ) -> (Self::AckStream, u32) {
+            (StubAckStream, 0)
+        }
+        fn disconnect_many(&self, _: Vec<Sid>) -> Result<(), Vec<SocketError>> {
+            Ok(())
+        }
+        fn path(&self) -> &Str {
+            &self.0
+        }
+        fn parser(&self) -> impl Parse {
+            CommonParser
+        }
+        fn server_id(&self) -> Uid {
+            Uid::ZERO
+        }
+        fn ack_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+    }
+
+    /// What the driver does when the adapter sends a request.
+    #[derive(Debug, Clone, Copy)]
+    enum Mode {
+        Success,
+        Fail,
+        Hang,
+    }
+
+    impl Mode {
+        async fn run(self) -> Result<(), std::io::Error> {
+            match self {
+                Mode::Success => Ok(()),
+                Mode::Fail => Err(std::io::Error::other("backend is down")),
+                Mode::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    struct StubNotification;
+    impl Notification for StubNotification {
+        fn channel(&self) -> &str {
+            ""
+        }
+        fn payload(&self) -> &str {
+            ""
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubDriver(Mode);
+    impl Driver for StubDriver {
+        type Error = std::io::Error;
+        type Notification = StubNotification;
+        type NotificationStream = futures_util::stream::Empty<StubNotification>;
+
+        async fn init(&self, _: &str) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn listen(&self, _: &[&str]) -> Result<Self::NotificationStream, Self::Error> {
+            Ok(futures_util::stream::empty())
+        }
+        async fn notify(&self, _: &str, _: &str) -> Result<(), Self::Error> {
+            self.0.run().await
+        }
+        async fn push_attachment(&self, _: &str, _: &[u8]) -> Result<i64, Self::Error> {
+            Ok(0)
+        }
+        async fn get_attachment(&self, _: &str, _: i64) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+        async fn cleanup_attachments(&self, _: &str, _: Duration) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn close(&self, _: &[&str]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn adapter(mode: Mode) -> CustomPostgresAdapter<StubEmitter, StubDriver> {
+        let state =
+            PostgresAdapterCtr::new_with_driver(StubDriver(mode), PostgresAdapterConfig::default());
+        CoreAdapter::new(&state, CoreLocalAdapter::new(StubEmitter(Str::from("/"))))
+    }
+
+    // `broadcast_with_ack` registers a response handler before publishing its request.
+    // The handler must be removed when the request can't be sent, otherwise each failed
+    // publish (e.g. during a backend outage) leaks one entry for the lifetime of the namespace.
+    fn packet() -> Packet {
+        Packet::event(Str::from("/"), Value::Str(Str::from("[\"event\"]"), None))
+    }
+
+    fn opts() -> BroadcastOptions {
+        let mut opts = BroadcastOptions::default();
+        opts.add_flag(BroadcastFlags::Broadcast);
+        opts
+    }
+
+    #[tokio::test]
+    async fn failed_request_removes_the_response_handler() {
+        let adapter = adapter(Mode::Fail);
+        let res = adapter.broadcast_with_ack(packet(), opts(), None).await;
+        assert!(matches!(res, Err(Error::Driver(_))));
+        assert!(adapter.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_removes_the_response_handler() {
+        let adapter = adapter(Mode::Hang);
+        let fut = adapter.broadcast_with_ack(packet(), opts(), None);
+        let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        assert!(res.is_err());
+        assert!(adapter.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_handler_lives_as_long_as_the_stream() {
+        let adapter = adapter(Mode::Success);
+        let stream = adapter
+            .broadcast_with_ack(packet(), opts(), None)
+            .await
+            .map_err(|_| "broadcast should succeed")
+            .unwrap();
+        assert_eq!(adapter.responses.lock().unwrap().len(), 1);
+        drop(stream);
+        assert!(adapter.responses.lock().unwrap().is_empty());
+    }
+}

@@ -26,7 +26,13 @@ use errors::{AdapterError, BroadcastError, SocketError};
 
 pub mod errors;
 #[cfg(feature = "remote-adapter")]
+pub mod heartbeat;
+#[cfg(feature = "remote-adapter")]
 pub mod remote_packet;
+#[cfg(feature = "remote-adapter")]
+pub mod request;
+#[cfg(feature = "remote-adapter")]
+pub mod stream;
 
 /// A room identifier
 pub type Room = Cow<'static, str>;
@@ -38,6 +44,11 @@ pub enum BroadcastFlags {
     Local = 0x01,
     /// Broadcast to all clients except the sender
     Broadcast = 0x02,
+    /// The event may be dropped if the client is not ready to receive it
+    /// (e.g. the connection is buffering or not connected).
+    /// This is useful for events that are not critical, like position updates in a game.
+    /// See [socket.io volatile events](https://socket.io/docs/v4/emitting-events/#volatile-events).
+    Volatile = 0x04,
 }
 
 /// Options that can be used to modify the behavior of the broadcast methods.
@@ -202,6 +213,10 @@ pub trait SocketEmitter: Send + Sync + 'static {
     fn get_remote_sockets(&self, sids: BroadcastIter<'_>) -> Vec<RemoteSocketData>;
     /// Send data to the list of socket ids.
     fn send_many(&self, sids: BroadcastIter<'_>, data: Value) -> Result<(), Vec<SocketError>>;
+    /// Send data to the list of socket ids with volatile semantics.
+    /// Errors are silently discarded; packets may be dropped if the
+    /// transport is not ready.
+    fn send_many_volatile(&self, sids: BroadcastIter<'_>, data: Value);
     /// Send data to the list of socket ids and get a stream of acks and the number of expected acks.
     fn send_many_with_ack(
         &self,
@@ -219,6 +234,8 @@ pub trait SocketEmitter: Send + Sync + 'static {
     fn parser(&self) -> impl Parse;
     /// Get the unique server id.
     fn server_id(&self) -> Uid;
+    /// Get the default configured ack timeout.
+    fn ack_timeout(&self) -> Duration;
 }
 
 /// For static namespaces, the init response will be managed by the user.
@@ -428,8 +445,14 @@ impl<E: SocketEmitter> CoreLocalAdapter<E> {
             return Ok(());
         }
 
+        let is_volatile = opts.has_flag(BroadcastFlags::Volatile);
         let data = self.emitter.parser().encode(packet);
-        self.emitter.send_many(sids, data)
+        if is_volatile {
+            self.emitter.send_many_volatile(sids, data);
+            Ok(())
+        } else {
+            self.emitter.send_many(sids, data)
+        }
     }
 
     /// Broadcasts the packet to the sockets that match the [`BroadcastOptions`] and return a stream of ack responses.
@@ -536,6 +559,10 @@ impl<E: SocketEmitter> CoreLocalAdapter<E> {
     pub fn server_id(&self) -> Uid {
         self.emitter.server_id()
     }
+    /// Get the default configured ack timeout.
+    pub fn ack_timeout(&self) -> Duration {
+        self.emitter.ack_timeout()
+    }
 }
 
 /// The default broadcast iterator.
@@ -543,7 +570,11 @@ impl<E: SocketEmitter> CoreLocalAdapter<E> {
 struct BroadcastRooms<'a> {
     rooms: slice::Iter<'a, Room>,
     rooms_map: &'a HashMap<Room, HashSet<Sid>>,
+    /// The sockets to skip: the excluded ones, and the
+    /// already returned ones when there are several rooms.
     except: HashSet<Sid>,
+    /// A socket can be in several rooms. With a single room there is nothing to track.
+    dedupe: bool,
     flatten_iter: Option<hash_set::Iter<'a, Sid>>,
 }
 impl<'a> BroadcastRooms<'a> {
@@ -556,6 +587,7 @@ impl<'a> BroadcastRooms<'a> {
             rooms: rooms.iter(),
             rooms_map,
             except,
+            dedupe: rooms.len() > 1,
             flatten_iter: None,
         }
     }
@@ -565,6 +597,12 @@ impl Iterator for BroadcastRooms<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.flatten_iter.as_mut().and_then(Iterator::next) {
+                Some(sid) if self.dedupe => {
+                    if self.except.insert(*sid) {
+                        return Some(*sid);
+                    }
+                    continue;
+                }
                 Some(sid) if !self.except.contains(sid) => return Some(*sid),
                 Some(_) => continue,
                 None => self.flatten_iter = None,
@@ -588,8 +626,11 @@ impl<E: SocketEmitter> CoreLocalAdapter<E> {
         let mut except = get_except_sids(&opts.except, rooms);
         // In case of broadcast flag + if the sender is set,
         // we should not broadcast to it.
-        if is_broadcast && opts.sid.is_some() {
-            except.insert(opts.sid.unwrap());
+        if is_broadcast {
+            //FIXME(1.88): switch to if let chains when available
+            if let Some(sid) = opts.sid {
+                except.insert(sid);
+            }
         }
 
         if !opts.rooms.is_empty() {
@@ -698,7 +739,7 @@ pub struct RemoteSocketData {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
 
     use smallvec::smallvec;
     use std::{
@@ -709,12 +750,12 @@ mod test {
 
     use super::*;
 
-    struct StubSockets {
+    pub(crate) struct StubSockets {
         sockets: HashSet<Sid>,
         path: Str,
     }
     impl StubSockets {
-        fn new(sockets: &[Sid]) -> Self {
+        pub(crate) fn new(sockets: &[Sid]) -> Self {
             let sockets = HashSet::from_iter(sockets.iter().copied());
             Self {
                 sockets,
@@ -723,7 +764,7 @@ mod test {
         }
     }
 
-    struct StubAckStream;
+    pub(crate) struct StubAckStream;
     impl Stream for StubAckStream {
         type Item = (Sid, Result<Value, StubError>);
         fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -736,7 +777,7 @@ mod test {
         }
     }
     #[derive(Debug, Serialize, Deserialize)]
-    struct StubError;
+    pub(crate) struct StubError;
     impl std::fmt::Display for StubError {
         fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             Ok(())
@@ -768,6 +809,8 @@ mod test {
             Ok(())
         }
 
+        fn send_many_volatile(&self, _: BroadcastIter<'_>, _: Value) {}
+
         fn send_many_with_ack(
             &self,
             _: BroadcastIter<'_>,
@@ -790,10 +833,86 @@ mod test {
         fn server_id(&self) -> Uid {
             Uid::ZERO
         }
+        fn ack_timeout(&self) -> Duration {
+            Duration::ZERO
+        }
     }
 
-    fn create_adapter<const S: usize>(sockets: [Sid; S]) -> CoreLocalAdapter<StubSockets> {
+    pub(crate) fn create_adapter<const S: usize>(
+        sockets: [Sid; S],
+    ) -> CoreLocalAdapter<StubSockets> {
         CoreLocalAdapter::new(StubSockets::new(&sockets))
+    }
+
+    #[test]
+    fn multiple_rooms_yield_each_socket_once() {
+        let [both, first, second] = [Sid::new(), Sid::new(), Sid::new()];
+        let adapter = create_adapter([both, first, second]);
+        adapter.add_all(both, ["room1", "room2"]);
+        adapter.add_all(first, ["room1"]);
+        adapter.add_all(second, ["room2"]);
+
+        let opts = BroadcastOptions {
+            rooms: smallvec::smallvec!["room1".into(), "room2".into()],
+            ..Default::default()
+        };
+        let mut sockets: Vec<Sid> = adapter
+            .fetch_sockets(opts)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        sockets.sort_by_key(|s| s.to_string());
+
+        let mut expected = vec![both, first, second];
+        expected.sort_by_key(|s| s.to_string());
+        assert_eq!(sockets, expected);
+    }
+
+    /// A duplicate must not end the iteration of the current room.
+    #[test]
+    fn multiple_rooms_with_many_overlapping_sockets() {
+        let shared: Vec<Sid> = (0..20).map(|_| Sid::new()).collect();
+        let only_second: Vec<Sid> = (0..20).map(|_| Sid::new()).collect();
+        let all: Vec<Sid> = shared.iter().chain(&only_second).copied().collect();
+        let adapter = CoreLocalAdapter::new(StubSockets::new(&all));
+        for sid in &shared {
+            adapter.add_all(*sid, ["room1", "room2"]);
+        }
+        for sid in &only_second {
+            adapter.add_all(*sid, ["room2"]);
+        }
+
+        let opts = BroadcastOptions {
+            rooms: smallvec::smallvec!["room1".into(), "room2".into()],
+            ..Default::default()
+        };
+        let ids: Vec<Sid> = adapter
+            .fetch_sockets(opts)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+
+        assert_eq!(ids.len(), all.len());
+        let ids: HashSet<Sid> = ids.into_iter().collect();
+        assert_eq!(ids, all.into_iter().collect());
+    }
+
+    #[test]
+    fn multiple_rooms_still_apply_except() {
+        let [both, first] = [Sid::new(), Sid::new()];
+        let adapter = create_adapter([both, first]);
+        adapter.add_all(both, ["room1", "room2", "excluded"]);
+        adapter.add_all(first, ["room1", "room2"]);
+
+        let opts = BroadcastOptions {
+            rooms: smallvec::smallvec!["room1".into(), "room2".into()],
+            except: smallvec::smallvec!["excluded".into()],
+            ..Default::default()
+        };
+        let sockets = adapter.fetch_sockets(opts);
+
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].id, first);
     }
 
     #[test]

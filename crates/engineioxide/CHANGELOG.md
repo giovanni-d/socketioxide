@@ -1,3 +1,42 @@
+# engineioxide 0.17.9
+* fix(security): bump `engineioxide-core` to 0.2.3, fixing a remote panic when parsing multibyte or truncated packets [#794](https://github.com/Totodore/socketioxide/pull/794).
+* fix: the websocket writer panicked if a polling request still held the socket lock at the end of an upgrade [#809](https://github.com/Totodore/socketioxide/pull/809).
+* fix: a malformed `sid` opened a new session. It now returns the `Session ID unknown` error of the protocol [#815](https://github.com/Totodore/socketioxide/pull/815).
+* fix: a request whose path only shares a prefix with `req_path` (e.g. `/engine.io-admin`) was captured by the
+service. It now goes to the inner service [#816](https://github.com/Totodore/socketioxide/pull/816).
+* fix: an extra pong received before the heartbeat job consumed the previous one was reported as a heartbeat
+timeout [#817](https://github.com/Totodore/socketioxide/pull/817).
+
+# engineioxide 0.17.8
+* feat: `EngineIoService` now implements the `tower`/`hyper` `Service` traits for `(stream, request)` pairs,
+to create a websocket connection from an already upgraded IO stream [#786](https://github.com/Totodore/socketioxide/pull/786).
+
+# engineioxide 0.17.7
+* feat(security): add `ws_max_message_size`/`ws_max_frame_size` config options to bound the size of incoming
+websocket messages and frames, preventing memory exhaustion by malicious clients. Defaults to 64 MiB/16 MiB.
+See [Github Advisory](https://github.com/Totodore/socketioxide/security/advisories/GHSA-55mf-67qm-4wpg).
+
+# engineioxide 0.17.6
+* feat: add `emit_{binary,many}_volatile` methods to `Socket` to emit volatile packets.
+
+# engineioxide 0.17.5
+fix: v3 packet header in polling payload should have a size in utf-16 code points.
+
+# engineioxide 0.17.4
+* MSRV: rust-version is now 1.94
+* fix: issue [#731](https://github.com/Totodore/socketioxide/issues/731). Memory leak with unclaimed engine.io sessions whose WebSocket upgrade is started but never completed.
+* fix: missing packet separator when polling a parked v4 encoder.
+* fix: incorrectly merged binary/string packets when polling a parked v3 encoder.
+* fix: v3 encoded payload size is never re-computed for max payload size threshold.
+* fix: v3 decoder infinite loop with malformed packet
+* fix: base64 binary packet protocol mismatch with payload starting with `4`.
+* fix: fix potential panic in debug with malicious v3 packets.
+* fix: expect b64 query param to be equal to 1 or true to enable b64 encoding.
+
+# engineioxide 0.17.3
+* fix: issue [#719](https://github.com/Totodore/socketioxide/issues/719). Because of an unpinned dependency on `tokio-util`
+building engineioxide would fail with `tokio-util < 0.7.14`.
+
 # engineioxide 0.17.2
 * fix: `Noop` packet was emitted only one time during the upgrade mechanism, leading to an infinite upgrade loop when the client sent multiple http polling requests.
 * fix: the socket closing process was incorrect in some edge cases, leading to leaky sockets. This fix ensures that sockets are properly closed and resources are released.

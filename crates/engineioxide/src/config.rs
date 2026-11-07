@@ -32,7 +32,7 @@
 
 use std::{borrow::Cow, time::Duration};
 
-use crate::service::TransportType;
+use engineioxide_core::TransportType;
 
 /// Configuration for the engine.io engine & transports
 #[derive(Debug, Clone)]
@@ -48,6 +48,10 @@ pub struct EngineIoConfig {
     /// The amount of time the server will wait for a ping response from the client before closing the connection.
     /// Defaults to 20 seconds.
     pub ping_timeout: Duration,
+
+    /// The amount of time the server will wait for a transport upgrade to complete before aborting it.
+    /// Defaults to 10 seconds.
+    pub upgrade_timeout: Duration,
 
     /// The maximum number of packets that can be buffered per connection before being emitted to the client.
     ///
@@ -67,6 +71,19 @@ pub struct EngineIoConfig {
     /// but will consume more memory.
     pub ws_read_buffer_size: usize,
 
+    /// The maximum size of an incoming message
+    ///
+    /// The default value is 64 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub ws_max_message_size: usize,
+
+    /// The maximum size of a single incoming message frame.
+    /// The limit is for frame payload NOT including the frame header.
+    ///
+    /// The default value is 16 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub ws_max_frame_size: usize,
+
     /// Allowed transports on this server
     /// It is represented as a bitfield to allow to combine any number of transports easily
     pub transports: u8,
@@ -78,9 +95,12 @@ impl Default for EngineIoConfig {
             req_path: "/engine.io".into(),
             ping_interval: Duration::from_millis(25000),
             ping_timeout: Duration::from_millis(20000),
+            upgrade_timeout: Duration::from_millis(10000),
             max_buffer_size: 128,
             max_payload: 1e5 as u64, // 100kb
             ws_read_buffer_size: 4096,
+            ws_max_message_size: 64 << 20,
+            ws_max_frame_size: 16 << 20,
             transports: TransportType::Polling as u8 | TransportType::Websocket as u8,
         }
     }
@@ -130,6 +150,15 @@ impl EngineIoConfigBuilder {
     /// Defaults to 20 seconds.
     pub fn ping_timeout(mut self, ping_timeout: Duration) -> Self {
         self.config.ping_timeout = ping_timeout;
+        self
+    }
+
+    /// The amount of time the server will wait for a transport upgrade to complete before aborting it
+    /// and reclaiming the session.
+    ///
+    /// Defaults to 10 seconds.
+    pub fn upgrade_timeout(mut self, upgrade_timeout: Duration) -> Self {
+        self.config.upgrade_timeout = upgrade_timeout;
         self
     }
 
@@ -188,6 +217,25 @@ impl EngineIoConfigBuilder {
     /// but will consume more memory.
     pub fn ws_read_buffer_size(mut self, ws_read_buffer_size: usize) -> Self {
         self.config.ws_read_buffer_size = ws_read_buffer_size;
+        self
+    }
+
+    /// The maximum size of an incoming message
+    ///
+    /// The default value is 64 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub fn ws_max_message_size(mut self, ws_max_message_size: usize) -> Self {
+        self.config.ws_max_message_size = ws_max_message_size;
+        self
+    }
+
+    /// The maximum size of a single incoming message frame.
+    /// The limit is for frame payload NOT including the frame header.
+    ///
+    /// The default value is 16 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub fn ws_max_frame_size(mut self, ws_max_frame_size: usize) -> Self {
+        self.config.ws_max_frame_size = ws_max_frame_size;
         self
     }
 

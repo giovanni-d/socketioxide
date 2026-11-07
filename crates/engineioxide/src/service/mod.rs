@@ -33,6 +33,8 @@ use std::{
 };
 
 use bytes::Bytes;
+#[cfg(feature = "__test_harness")]
+use engineioxide_core::ProtocolVersion;
 use futures_util::future::{self, Ready};
 use http::{Request, Response};
 use http_body::Body;
@@ -42,12 +44,12 @@ use tower_service::Service as TowerSvc;
 
 use crate::{
     body::ResponseBody, config::EngineIoConfig, engine::EngineIo, handler::EngineIoHandler,
+    service::parser::RequestInfo,
 };
 
 mod futures;
 mod parser;
 
-pub use self::parser::{ProtocolVersion, TransportType};
 use self::{futures::ResponseFuture, parser::dispatch_req};
 
 /// A `Service` that handles engine.io requests as a middleware.
@@ -127,11 +129,29 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let path = self.engine.config.req_path.as_ref();
-        if req.uri().path().starts_with(path) {
+        if is_req_path(req.uri().path(), path) {
             dispatch_req(req, self.engine.clone())
         } else {
             ResponseFuture::new(self.inner.call(req))
         }
+    }
+}
+
+impl<St, H, Svc> TowerSvc<(St, http::Request<()>)> for EngineIoService<H, Svc>
+where
+    H: EngineIoHandler,
+    St: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type Response = ();
+    type Error = parser::ParseError;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, (conn, req): (St, http::Request<()>)) -> Self::Future {
+        std::future::ready(ws_conn_inner(self.engine.clone(), conn, req))
     }
 }
 
@@ -151,12 +171,51 @@ where
 
     fn call(&self, req: Request<ReqBody>) -> Self::Future {
         let path = self.engine.config.req_path.as_ref();
-        if req.uri().path().starts_with(path) {
+        if is_req_path(req.uri().path(), path) {
             dispatch_req(req, self.engine.clone())
         } else {
             ResponseFuture::new(self.inner.call(req))
         }
     }
+}
+
+impl<St, H, Svc> HyperSvc<(St, http::Request<()>)> for EngineIoService<H, Svc>
+where
+    H: EngineIoHandler,
+    St: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type Response = ();
+    type Error = parser::ParseError;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn call(&self, (conn, req): (St, http::Request<()>)) -> Self::Future {
+        std::future::ready(ws_conn_inner(self.engine.clone(), conn, req))
+    }
+}
+
+/// Check if a request path is the configured path or one of its sub paths.
+/// `/engine.io` must not match `/engine.io-admin`, which belongs to the inner service.
+fn is_req_path(path: &str, req_path: &str) -> bool {
+    path.strip_prefix(req_path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || req_path.ends_with('/'))
+}
+
+fn ws_conn_inner<St, H>(
+    engine: Arc<EngineIo<H>>,
+    conn: St,
+    req: http::Request<()>,
+) -> Result<(), parser::ParseError>
+where
+    H: EngineIoHandler,
+    St: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let RequestInfo { protocol, sid, .. } = RequestInfo::parse(&req, &engine.config)?;
+
+    let (parts, _) = req.into_parts();
+    let fut = crate::transport::ws::on_init(engine, conn, protocol, sid, parts);
+    tokio::spawn(fut);
+
+    Ok(())
 }
 
 #[cfg(feature = "__test_harness")]

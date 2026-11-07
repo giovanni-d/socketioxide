@@ -9,6 +9,7 @@ use serde::Serialize;
 use socketioxide_core::{
     Sid, Uid,
     adapter::{DefinedAdapter, Room, RoomParam},
+    parser::ParseConfig,
 };
 use socketioxide_parser_common::CommonParser;
 #[cfg(feature = "msgpack")]
@@ -32,19 +33,61 @@ use crate::{
 ///
 /// Be sure that the selected parser matches the client parser.
 #[derive(Debug, Clone)]
-pub struct ParserConfig(Parser);
+pub struct ParserConfig<T> {
+    parser: T,
+    config: ParseConfig,
+}
 
-impl ParserConfig {
+impl ParserConfig<()> {
     /// Use a [`CommonParser`] to parse incoming and outgoing socket.io packets
-    pub fn common() -> Self {
-        ParserConfig(Parser::Common(CommonParser))
+    pub fn common() -> ParserConfig<CommonParser> {
+        ParserConfig {
+            parser: CommonParser,
+            config: ParseConfig::default(),
+        }
     }
 
     /// Use a [`MsgPackParser`] to parse incoming and outgoing socket.io packets
-    #[cfg_attr(docsrs, doc(cfg(feature = "msgpack")))]
     #[cfg(feature = "msgpack")]
-    pub fn msgpack() -> Self {
-        ParserConfig(Parser::MsgPack(MsgPackParser))
+    pub fn msgpack() -> ParserConfig<MsgPackParser> {
+        ParserConfig {
+            parser: MsgPackParser,
+            config: ParseConfig::default(),
+        }
+    }
+}
+impl ParserConfig<CommonParser> {
+    /// Maximum buffer size of all the incoming binary attachments.
+    ///
+    /// If the sum of each attachment exceeds this limit,
+    /// the packet will be dropped and the connection closed.
+    ///
+    /// It is important to set a limit for [`EngineIoConfig::max_payload`] that match.
+    ///
+    /// Default to 10 MB
+    pub fn max_incoming_binary_buf_size(mut self, value: usize) -> Self {
+        self.config.max_incoming_binary_buf_size = value;
+        self
+    }
+
+    /// Maximum number of incoming binary attachments.
+    ///
+    /// If the incoming binary count is exceeded,
+    /// the packet will be dropped and the connection closed.
+    ///
+    /// Default to 10_000
+    pub fn max_incoming_binaries(mut self, value: usize) -> Self {
+        self.config.max_incoming_binaries = value;
+        self
+    }
+
+    /// Timeout after which it is no longer tolerable to wait for partial binary packets,
+    /// the entire packet will dropped and the connection closed.
+    ///
+    /// Default to 1min
+    pub fn packet_completion_timeout(mut self, timeout: Duration) -> Self {
+        self.config.packet_completion_timeout = timeout;
+        self
     }
 }
 
@@ -67,6 +110,9 @@ pub struct SocketIoConfig {
     /// The parser to use to encode and decode socket.io packets
     pub(crate) parser: Parser,
 
+    /// Config for parser behaviors
+    pub(crate) parse_config: ParseConfig,
+
     /// A global server identifier
     pub server_id: Uid,
 }
@@ -81,6 +127,7 @@ impl Default for SocketIoConfig {
             ack_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(45),
             parser: Parser::default(),
+            parse_config: ParseConfig::default(),
             server_id: Uid::new(),
         }
     }
@@ -137,6 +184,16 @@ impl<A: Adapter> SocketIoBuilder<A> {
         self
     }
 
+    /// The amount of time the server will wait for a transport upgrade (HTTP long-polling to
+    /// WebSocket) to complete before aborting it and reclaiming the session.
+    ///
+    /// Defaults to 10 seconds.
+    #[inline]
+    pub fn upgrade_timeout(mut self, upgrade_timeout: Duration) -> Self {
+        self.engine_config_builder = self.engine_config_builder.upgrade_timeout(upgrade_timeout);
+        self
+    }
+
     /// The maximum number of packets that can be buffered per connection before being emitted to the client.
     /// If the buffer if full the `emit()` method will return an error
     ///
@@ -167,6 +224,29 @@ impl<A: Adapter> SocketIoBuilder<A> {
         self.engine_config_builder = self
             .engine_config_builder
             .ws_read_buffer_size(ws_read_buffer_size);
+        self
+    }
+
+    /// The maximum size of an incoming message
+    ///
+    /// The default value is 64 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub fn ws_max_message_size(mut self, ws_max_message_size: usize) -> Self {
+        self.engine_config_builder = self
+            .engine_config_builder
+            .ws_max_message_size(ws_max_message_size);
+        self
+    }
+
+    /// The maximum size of a single incoming message frame.
+    /// The limit is for frame payload NOT including the frame header.
+    ///
+    /// The default value is 16 MiB which should be reasonably big for all normal use-cases but small enough
+    /// to prevent memory eating by a malicious user.
+    pub fn ws_max_frame_size(mut self, ws_max_frame_size: usize) -> Self {
+        self.engine_config_builder = self
+            .engine_config_builder
+            .ws_max_frame_size(ws_max_frame_size);
         self
     }
 
@@ -208,15 +288,34 @@ impl<A: Adapter> SocketIoBuilder<A> {
     }
 
     /// Set a custom [`ParserConfig`] for this [`SocketIoBuilder`]
+    ///
+    /// # Using the msgpack parser
     /// ```
     /// # use socketioxide::{SocketIo, ParserConfig};
     /// let (io, layer) = SocketIo::builder()
     ///     .with_parser(ParserConfig::msgpack())
     ///     .build_layer();
     /// ```
+    ///
+    /// # Using the common parser and customizing config
+    /// ```
+    /// # use socketioxide::{SocketIo, ParserConfig};
+    /// # use std::time::Duration;
+    /// let parser = ParserConfig::common()
+    ///     .max_incoming_binary_buf_size(1e5 as usize) // 100 kb
+    ///     .max_incoming_binaries(10)
+    ///     .packet_completion_timeout(Duration::from_millis(200));
+    ///
+    /// let (io, layer) = SocketIo::builder()
+    ///     .with_parser(parser)
+    ///     .build_layer();
+    /// ```
     #[inline]
-    pub fn with_parser(mut self, parser: ParserConfig) -> Self {
-        self.config.parser = parser.0;
+    #[expect(private_bounds)] // Parser should only be set from parser config anyway
+    pub fn with_parser<T: Into<Parser>>(mut self, parser_config: ParserConfig<T>) -> Self {
+        let ParserConfig { parser, config } = parser_config;
+        self.config.parser = parser.into();
+        self.config.parse_config = config;
         self
     }
 
@@ -236,7 +335,6 @@ impl<A: Adapter> SocketIoBuilder<A> {
     /// You can set any number of states as long as they have different types.
     /// The state must be cloneable, therefore it is recommended to wrap it in an `Arc` if you want shared state.
     #[inline]
-    #[cfg_attr(docsrs, doc(cfg(feature = "state")))]
     #[cfg(feature = "state")]
     pub fn with_state<S: Clone + Send + Sync + 'static>(self, state: S) -> Self {
         self.state.set(state);
@@ -581,6 +679,12 @@ impl<A: Adapter> SocketIo<A> {
     #[inline]
     pub fn broadcast(&self) -> BroadcastOperators<A> {
         self.get_default_op()
+    }
+
+    #[doc = include_str!("../docs/operators/volatile.md")]
+    #[inline]
+    pub fn volatile(&self) -> BroadcastOperators<A> {
+        self.get_default_op().volatile()
     }
 
     #[cfg(feature = "state")]

@@ -1,33 +1,4 @@
-#![warn(
-    clippy::all,
-    clippy::todo,
-    clippy::empty_enum,
-    clippy::mem_forget,
-    clippy::unused_self,
-    clippy::filter_map_next,
-    clippy::needless_continue,
-    clippy::needless_borrow,
-    clippy::match_wildcard_for_single_variants,
-    clippy::if_let_mutex,
-    clippy::await_holding_lock,
-    clippy::imprecise_flops,
-    clippy::suboptimal_flops,
-    clippy::lossy_float_literal,
-    clippy::rest_pat_in_fully_bound_structs,
-    clippy::fn_params_excessive_bools,
-    clippy::exit,
-    clippy::inefficient_to_string,
-    clippy::linkedlist,
-    clippy::macro_use_imports,
-    clippy::option_option,
-    clippy::verbose_file_reads,
-    clippy::unnested_or_patterns,
-    rust_2018_idioms,
-    future_incompatible,
-    nonstandard_style,
-    missing_docs
-)]
-
+#![warn(missing_docs)]
 //! The msgpack parser sub-crate for the socketioxide crate.
 //!
 //! This is a custom parser implementation that can be enable with the `msgpack` feature flag in socketioxide.
@@ -53,7 +24,7 @@ use serde::Deserialize;
 use socketioxide_core::{
     Str, Value,
     packet::Packet,
-    parser::{Parse, ParseError, ParserError, ParserState},
+    parser::{Parse, ParseConfig, ParseError, ParserError, ParserState},
 };
 
 mod de;
@@ -70,11 +41,21 @@ impl Parse for MsgPackParser {
         Value::Bytes(data.into())
     }
 
-    fn decode_str(self, _: &ParserState, _data: Str) -> Result<Packet, ParseError> {
+    fn decode_str(
+        self,
+        _: &ParseConfig,
+        _: &ParserState,
+        _data: Str,
+    ) -> Result<Packet, ParseError> {
         Err(ParseError::UnexpectedStringPacket)
     }
 
-    fn decode_bin(self, _: &ParserState, bin: Bytes) -> Result<Packet, ParseError> {
+    fn decode_bin(
+        self,
+        _: &ParseConfig,
+        _: &ParserState,
+        bin: Bytes,
+    ) -> Result<Packet, ParseError> {
         deserialize_packet(bin)
     }
 
@@ -131,7 +112,11 @@ mod tests {
 
     fn decode(value: &'static [u8]) -> Packet {
         MsgPackParser
-            .decode_bin(&Default::default(), Bytes::from_static(value))
+            .decode_bin(
+                &Default::default(),
+                &Default::default(),
+                Bytes::from_static(value),
+            )
             .unwrap()
     }
     fn encode(packet: Packet) -> Bytes {

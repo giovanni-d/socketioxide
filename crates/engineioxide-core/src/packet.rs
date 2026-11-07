@@ -1,16 +1,14 @@
+use std::{fmt, time::Duration};
+
 use base64::{Engine, engine::general_purpose};
 use bytes::Bytes;
-use engineioxide_core::{Sid, Str};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use smallvec::{SmallVec, smallvec};
-use std::time::Duration;
+use smallvec::SmallVec;
 
-use crate::TransportType;
-use crate::config::EngineIoConfig;
-use crate::errors::Error;
+use crate::{ProtocolVersion, Sid, Str, TransportType};
 
 /// A Packet type to use when receiving and sending data from the client
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
     /// Open packet used to initiate a connection
     Open(OpenPacket),
@@ -53,6 +51,67 @@ pub enum Packet {
     BinaryV3(Bytes), // Not part of the protocol, used internally
 }
 
+/// An error that occurs when parsing a packet.
+#[derive(Debug)]
+pub enum PacketParseError {
+    /// Invalid connect packet
+    InvalidConnectPacket(serde_json::Error),
+    /// The packet type is invalid.
+    InvalidPacketType(Option<char>),
+    /// The packet payload is invalid.
+    InvalidPacketPayload,
+    /// The packet length is invalid.
+    InvalidPacketLen,
+    /// The packet chunk is invalid
+    InvalidUtf8Boundary(std::str::Utf8Error),
+    /// The base64 decoding failed.
+    Base64Decode(base64::DecodeError),
+    /// The payload is too large.
+    PayloadTooLarge {
+        /// The maximum allowed payload size.
+        max: u64,
+    },
+}
+impl fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PacketParseError::InvalidConnectPacket(e) => write!(f, "invalid connect packet: {e}"),
+            PacketParseError::InvalidPacketType(c) => write!(f, "invalid packet type: {c:?}"),
+            PacketParseError::InvalidPacketPayload => write!(f, "invalid packet payload"),
+            PacketParseError::InvalidPacketLen => write!(f, "invalid packet length"),
+            PacketParseError::InvalidUtf8Boundary(err) => write!(
+                f,
+                "invalid utf8 boundary when parsing payload into packet chunks: {err}"
+            ),
+            PacketParseError::Base64Decode(err) => write!(f, "base64 decode error: {err}"),
+            PacketParseError::PayloadTooLarge { max } => {
+                write!(f, "payload too large: max {max}")
+            }
+        }
+    }
+}
+impl From<base64::DecodeError> for PacketParseError {
+    fn from(err: base64::DecodeError) -> Self {
+        PacketParseError::Base64Decode(err)
+    }
+}
+impl From<std::string::FromUtf8Error> for PacketParseError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        PacketParseError::InvalidUtf8Boundary(err.utf8_error())
+    }
+}
+impl From<std::str::Utf8Error> for PacketParseError {
+    fn from(err: std::str::Utf8Error) -> Self {
+        PacketParseError::InvalidUtf8Boundary(err)
+    }
+}
+impl From<serde_json::Error> for PacketParseError {
+    fn from(err: serde_json::Error) -> Self {
+        PacketParseError::InvalidConnectPacket(err)
+    }
+}
+impl std::error::Error for PacketParseError {}
+
 impl Packet {
     /// Check if the packet is a binary packet
     pub fn is_binary(&self) -> bool {
@@ -60,7 +119,7 @@ impl Packet {
     }
 
     /// If the packet is a message packet (text), it returns the message
-    pub(crate) fn into_message(self) -> Str {
+    pub fn into_message(self) -> Str {
         match self {
             Packet::Message(msg) => msg,
             _ => panic!("Packet is not a message"),
@@ -68,7 +127,7 @@ impl Packet {
     }
 
     /// If the packet is a binary packet, it returns the binary data
-    pub(crate) fn into_binary(self) -> Bytes {
+    pub fn into_binary(self) -> Bytes {
         match self {
             Packet::Binary(data) => data,
             Packet::BinaryV3(data) => data,
@@ -81,7 +140,7 @@ impl Packet {
     ///  If b64 is true, it returns the max size when serialized to base64
     ///
     /// The base64 max size factor is `ceil(n / 3) * 4`
-    pub(crate) fn get_size_hint(&self, b64: bool) -> usize {
+    pub fn get_size_hint(&self, b64: bool) -> usize {
         match self {
             Packet::Open(_) => 156, // max possible size for the open packet serialized
             Packet::Close => 1,
@@ -107,6 +166,12 @@ impl Packet {
                 }
             }
         }
+    }
+}
+
+impl From<Packet> for Bytes {
+    fn from(value: Packet) -> Self {
+        String::from(value).into()
     }
 }
 
@@ -143,25 +208,21 @@ impl From<Packet> for String {
         buffer
     }
 }
-impl From<Packet> for tokio_tungstenite::tungstenite::Utf8Bytes {
-    fn from(value: Packet) -> Self {
-        String::from(value).into()
-    }
-}
-impl From<Packet> for Bytes {
-    fn from(value: Packet) -> Self {
-        String::from(value).into()
-    }
-}
+
 /// Deserialize a [Packet] from a [String] according to the Engine.IO protocol
-impl TryFrom<Str> for Packet {
-    type Error = Error;
-    fn try_from(value: Str) -> Result<Self, Self::Error> {
+impl Packet {
+    /// Parses a packet from a string value using the specified protocol version.
+    pub fn parse(
+        protocol: ProtocolVersion,
+        value: impl Into<Str>,
+    ) -> Result<Self, PacketParseError> {
+        let value = value.into();
         let packet_type = value
             .as_bytes()
             .first()
-            .ok_or(Error::InvalidPacketType(None))?;
-        let is_upgrade = value.len() == 6 && &value[1..6] == "probe";
+            .ok_or(PacketParseError::InvalidPacketType(None))?;
+        // Compare raw bytes to avoid slicing into a char boundary.
+        let is_upgrade = value.as_bytes().get(1..) == Some(b"probe");
         let res = match packet_type {
             b'1' => Packet::Close,
             b'2' if is_upgrade => Packet::PingUpgrade,
@@ -171,53 +232,45 @@ impl TryFrom<Str> for Packet {
             b'4' => Packet::Message(value.slice(1..)),
             b'5' => Packet::Upgrade,
             b'6' => Packet::Noop,
-            b'b' if value.as_bytes().get(1) == Some(&b'4') => Packet::BinaryV3(
-                general_purpose::STANDARD
-                    .decode(value.slice(2..).as_bytes())?
-                    .into(),
-            ),
-            b'b' => Packet::Binary(
-                general_purpose::STANDARD
-                    .decode(value.slice(1..).as_bytes())?
-                    .into(),
-            ),
-            c => Err(Error::InvalidPacketType(Some(*c as char)))?,
+            b'b' if protocol == ProtocolVersion::V3 && value.as_bytes().get(1) == Some(&b'4') => {
+                Packet::BinaryV3(general_purpose::STANDARD.decode(&value[2..])?.into())
+            }
+            b'b' if protocol == ProtocolVersion::V4 => {
+                Packet::Binary(general_purpose::STANDARD.decode(&value[1..])?.into())
+            }
+            c => Err(PacketParseError::InvalidPacketType(Some(*c as char)))?,
         };
         Ok(res)
     }
 }
-impl TryFrom<tokio_tungstenite::tungstenite::Utf8Bytes> for Packet {
-    type Error = Error;
-    fn try_from(value: tokio_tungstenite::tungstenite::Utf8Bytes) -> Result<Self, Self::Error> {
-        // SAFETY: The utf8 bytes are guaranteed to be valid utf8
-        Packet::try_from(unsafe { Str::from_bytes_unchecked(value.into()) })
-    }
-}
-
-impl TryFrom<String> for Packet {
-    type Error = Error;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Packet::try_from(Str::from(value))
-    }
-}
 
 /// An OpenPacket is used to initiate a connection
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenPacket {
-    sid: Sid,
-    upgrades: SmallVec<[TransportType; 1]>,
+    /// The session ID.
+    pub sid: Sid,
+
+    /// The list of available transport upgrades.
+    pub upgrades: SmallVec<[TransportType; 1]>,
+
+    /// The ping interval, used in the heartbeat mechanism.
     #[serde(
         serialize_with = "serialize_duration_millis",
         deserialize_with = "deserialize_duration_from_millis"
     )]
-    ping_interval: Duration,
+    pub ping_interval: Duration,
+
+    /// The ping timeout, used in the heartbeat mechanism.
     #[serde(
         serialize_with = "serialize_duration_millis",
         deserialize_with = "deserialize_duration_from_millis"
     )]
-    ping_timeout: Duration,
-    max_payload: u64,
+    pub ping_timeout: Duration,
+
+    /// The maximum number of bytes per chunk, used by the client to
+    /// aggregate packets into payloads.
+    pub max_payload: u64,
 }
 
 /// Helper to serialize a duration as milliseconds
@@ -238,40 +291,117 @@ where
     Ok(Duration::from_millis(millis))
 }
 
-impl OpenPacket {
-    /// Create a new [OpenPacket]
-    /// If the current transport is polling, the server will always allow the client to upgrade to websocket
-    pub fn new(transport: TransportType, sid: Sid, config: &EngineIoConfig) -> Self {
-        let upgrades = if transport == TransportType::Polling {
-            smallvec![TransportType::Websocket]
-        } else {
-            smallvec![]
-        };
-        OpenPacket {
-            sid,
-            upgrades,
-            ping_interval: config.ping_interval,
-            ping_timeout: config.ping_timeout,
-            max_payload: config.max_payload,
+/// This default implementation should only be used for testing purposes.
+impl Default for OpenPacket {
+    fn default() -> Self {
+        Self {
+            sid: Sid::ZERO,
+            upgrades: smallvec::smallvec![TransportType::Websocket],
+            ping_interval: Duration::from_millis(25000),
+            ping_timeout: Duration::from_millis(20000),
+            max_payload: 100000,
         }
     }
 }
 
+/// Buffered packets to send to the client.
+/// It is used to ensure atomicity when sending multiple packets to the client.
+///
+/// The [`PacketBuf`] stack size will impact the dynamically allocated buffer
+/// of the internal mpsc channel.
+pub type PacketBuf = SmallVec<[Packet; 2]>;
+
 #[cfg(test)]
 mod tests {
-    use crate::config::EngineIoConfig;
 
     use super::*;
-    use std::{convert::TryInto, time::Duration};
+    use std::time::Duration;
+
+    #[test]
+    fn test_parse_multibyte_6_bytes_does_not_panic() {
+        // 6 bytes long with a first char of 2 bytes: `1..6` is not on a char boundary.
+        let value = "éabcd";
+        assert_eq!(value.len(), 6);
+        for protocol in [ProtocolVersion::V3, ProtocolVersion::V4] {
+            assert!(matches!(
+                Packet::parse(protocol, value),
+                Err(PacketParseError::InvalidPacketType(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_multibyte_after_packet_type() {
+        // 6 bytes long with a valid packet type, but the remaining bytes are not "probe".
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "2éabc").unwrap(),
+            Packet::Ping
+        );
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "3éabc").unwrap(),
+            Packet::Pong
+        );
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "4éabc").unwrap(),
+            Packet::Message("éabc".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_packets() {
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "2probe").unwrap(),
+            Packet::PingUpgrade
+        );
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "3probe").unwrap(),
+            Packet::PongUpgrade
+        );
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V4, "4probe").unwrap(),
+            Packet::Message("probe".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_v3_binary_without_type_does_not_panic() {
+        assert!(matches!(
+            Packet::parse(ProtocolVersion::V3, "b"),
+            Err(PacketParseError::InvalidPacketType(Some('b')))
+        ));
+    }
+
+    #[test]
+    fn test_parse_v3_binary_multibyte_is_rejected() {
+        // the second char is multibyte: the base64 decoder gets the bytes after the type byte
+        assert!(matches!(
+            Packet::parse(ProtocolVersion::V3, "bé"),
+            Err(PacketParseError::InvalidPacketType(Some('b')))
+        ));
+    }
+
+    #[test]
+    fn test_parse_v3_binary() {
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V3, "b4AQID").unwrap(),
+            Packet::BinaryV3(Bytes::from_static(&[1, 2, 3]))
+        );
+        assert_eq!(
+            Packet::parse(ProtocolVersion::V3, "b4").unwrap(),
+            Packet::BinaryV3(Bytes::new())
+        );
+    }
 
     #[test]
     fn test_open_packet() {
         let sid = Sid::new();
-        let packet = Packet::Open(OpenPacket::new(
-            TransportType::Polling,
+        let packet = Packet::Open(OpenPacket {
             sid,
-            &EngineIoConfig::default(),
-        ));
+            upgrades: smallvec::smallvec![TransportType::Websocket],
+            ping_interval: Duration::from_millis(25000),
+            ping_timeout: Duration::from_millis(20000),
+            max_payload: 100000,
+        });
         let packet_str: String = packet.into();
         assert_eq!(
             packet_str,
@@ -289,13 +419,6 @@ mod tests {
     }
 
     #[test]
-    fn test_message_packet_deserialize() {
-        let packet_str = "4hello".to_string();
-        let packet: Packet = packet_str.try_into().unwrap();
-        assert_eq!(packet, Packet::Message("hello".into()));
-    }
-
-    #[test]
     fn test_binary_packet() {
         let packet = Packet::Binary(vec![1, 2, 3].into());
         let packet_str: String = packet.into();
@@ -303,10 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_packet_deserialize() {
-        let packet_str = "bAQID".to_string();
-        let packet: Packet = packet_str.try_into().unwrap();
-        assert_eq!(packet, Packet::Binary(vec![1, 2, 3].into()));
+    fn test_binary_packet_v4_deserialize_payload_starting_with_4() {
+        let data = vec![0xE0, 0xE1, 0xE2];
+        // Sanity check: the base64 encoding indeed starts with '4'.
+        let packet_str: String = Packet::Binary(data.clone().into()).into();
+        assert_eq!(packet_str, "b4OHi");
+
+        let packet = Packet::parse(ProtocolVersion::V4, packet_str).unwrap();
+        assert_eq!(packet, Packet::Binary(data.into()));
     }
 
     #[test]
@@ -317,27 +444,15 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_packet_v3_deserialize() {
-        let packet_str = "b4AQID".to_string();
-        let packet: Packet = packet_str.try_into().unwrap();
-        assert_eq!(packet, Packet::BinaryV3(vec![1, 2, 3].into()));
-    }
-
-    #[test]
     fn test_packet_get_size_hint() {
         // Max serialized packet
-        let open = OpenPacket::new(
-            TransportType::Polling,
-            Sid::new(),
-            &EngineIoConfig {
-                max_buffer_size: usize::MAX,
-                max_payload: u64::MAX,
-                ping_interval: Duration::MAX,
-                ping_timeout: Duration::MAX,
-                transports: TransportType::Polling as u8 | TransportType::Websocket as u8,
-                ..Default::default()
-            },
-        );
+        let open = OpenPacket {
+            sid: Sid::new(),
+            ping_interval: Duration::MAX,
+            ping_timeout: Duration::MAX,
+            max_payload: u64::MAX,
+            upgrades: smallvec::smallvec![TransportType::Websocket],
+        };
         let size = serde_json::to_string(&open).unwrap().len();
         let packet = Packet::Open(open);
         assert_eq!(packet.get_size_hint(false), size);

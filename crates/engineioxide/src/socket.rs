@@ -56,6 +56,7 @@
 //! ```
 use std::{
     collections::VecDeque,
+    fmt::Debug,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -63,21 +64,16 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    config::EngineIoConfig,
-    errors::Error,
-    packet::Packet,
-    peekable::PeekableReceiver,
-    service::{ProtocolVersion, TransportType},
-};
+use crate::{config::EngineIoConfig, errors::Error};
 use bytes::Bytes;
-use engineioxide_core::Str;
+use engineioxide_core::{Packet, PacketBuf, ProtocolVersion, Str, TransportType};
 use futures_util::FutureExt;
 use http::request::Parts;
 use smallvec::{SmallVec, smallvec};
 use tokio::sync::{
     Mutex,
     mpsc::{self, Receiver, error::TrySendError},
+    watch,
 };
 
 pub use engineioxide_core::Sid;
@@ -108,9 +104,8 @@ impl From<&Error> for Option<DisconnectReason> {
     fn from(err: &Error) -> Self {
         use Error::*;
         match err {
-            WsTransport(_) | Io(_) => Some(DisconnectReason::TransportError),
-            BadPacket(_) | Base64(_) | StrUtf8(_) | PayloadTooLarge | InvalidPacketLength
-            | InvalidPacketType(_) => Some(DisconnectReason::PacketParsingError),
+            WsTransport(_) => Some(DisconnectReason::TransportError),
+            BadPacket(_) | PacketParse(_) => Some(DisconnectReason::PacketParsingError),
             HeartbeatTimeout => Some(DisconnectReason::HeartbeatTimeout),
             _ => None,
         }
@@ -159,12 +154,25 @@ impl Permit<'_> {
     }
 }
 
-/// Buffered packets to send to the client.
-/// It is used to ensure atomicity when sending multiple packets to the client.
-///
-/// The [`PacketBuf`] stack size will impact the dynamically allocated buffer
-/// of the internal mpsc channel.
-pub(crate) type PacketBuf = SmallVec<[Packet; 2]>;
+#[derive(Debug)]
+pub(crate) struct InternalRx {
+    pub buffered_rx: Receiver<PacketBuf>,
+    pub peeked_packet: Option<PacketBuf>,
+    pub volatile_rx: watch::Receiver<Option<PacketBuf>>,
+}
+
+impl InternalRx {
+    fn new(
+        buffered_rx: Receiver<PacketBuf>,
+        volatile_rx: watch::Receiver<Option<PacketBuf>>,
+    ) -> Self {
+        Self {
+            buffered_rx,
+            peeked_packet: None,
+            volatile_rx,
+        }
+    }
+}
 
 /// A [`Socket`] represents a client connection to the server.
 /// It is agnostic to the [`TransportType`].
@@ -200,17 +208,18 @@ where
     /// * In case of polling transport it will be locked and released for each request
     /// * In case of websocket transport it will always be locked until the connection is closed
     ///
-    /// It will be closed when a [`Close`](Packet::Close) packet is received:
-    /// * From the [encoder](crate::service::encoder) if the transport is polling
-    /// * From the fn [`on_ws_req_init`](crate::engine::EngineIo) if the transport is websocket
-    /// * Automatically via the [`close_session fn`](crate::engine::EngineIo::close_session) as a fallback.
-    ///   Because with polling transport, if the client is not currently polling then the encoder will never be able to close the channel
+    /// Closing behavior is driven by the [`Socket::cancellation_token`].
     ///
     /// The channel is made of a [`SmallVec`] of [`Packet`]s so that adjacent packets can be sent atomically.
-    pub(crate) internal_rx: Mutex<PeekableReceiver<PacketBuf>>,
+    pub(crate) internal_rx: Mutex<InternalRx>,
 
     /// Channel to send [PacketBuf] to the internal connection
-    internal_tx: mpsc::Sender<PacketBuf>,
+    pub(crate) internal_tx: mpsc::Sender<PacketBuf>,
+
+    /// Channel to send volatile [PacketBuf]s that bypass the internal buffer.
+    /// Uses a [`watch`](tokio::sync::watch) channel so only the latest volatile
+    /// message is retained; subsequent volatile sends overwrite the previous one.
+    volatile_tx: watch::Sender<Option<PacketBuf>>,
 
     /// Internal channel to receive Pong [`Packets`](Packet) (v4 protocol) or Ping (v3 protocol) in the heartbeat job
     /// which is running in a separate task
@@ -231,7 +240,6 @@ where
     pub req_parts: Parts,
 
     /// If the client supports binary packets (via polling XHR2)
-    #[cfg(feature = "v3")]
     pub(crate) supports_binary: bool,
 }
 
@@ -245,10 +253,11 @@ where
         config: &EngineIoConfig,
         req_parts: Parts,
         close_fn: Box<dyn Fn(Sid, DisconnectReason) + Send + Sync>,
-        #[cfg(feature = "v3")] supports_binary: bool,
+        supports_binary: bool,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::channel(config.max_buffer_size);
         let (heartbeat_tx, heartbeat_rx) = mpsc::channel(1);
+        let (volatile_tx, volatile_rx) = watch::channel(None);
 
         Self {
             id: Sid::new(),
@@ -256,8 +265,10 @@ where
             transport: AtomicU8::new(transport as u8),
             upgrading: AtomicBool::new(false),
 
-            internal_rx: Mutex::new(PeekableReceiver::new(internal_rx)),
+            internal_rx: Mutex::new(InternalRx::new(internal_rx, volatile_rx)),
             internal_tx,
+
+            volatile_tx,
 
             heartbeat_rx: Mutex::new(heartbeat_rx),
             heartbeat_tx,
@@ -268,7 +279,6 @@ where
             data: D::default(),
             req_parts,
 
-            #[cfg(feature = "v3")]
             supports_binary,
         }
     }
@@ -452,6 +462,7 @@ where
 
     /// Immediately closes the socket and the underlying connection.
     /// The socket will be removed from the `Engine` and the [`Handler`](crate::handler::EngineIoHandler) will be notified.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub fn close(&self, reason: DisconnectReason) {
         // Try to send a close packet is the connection is still operational.
         self.send(Packet::Close).ok();
@@ -487,6 +498,55 @@ where
             TrySendError::Full(p) => TrySendError::Full(p.into_binary()),
             TrySendError::Closed(p) => TrySendError::Closed(p.into_binary()),
         })
+    }
+
+    /// Try to send a volatile message bypassing the internal buffer channel.
+    /// Volatile messages may be dropped if the transport is not ready to
+    /// receive them.
+    ///
+    /// Because volatile messages bypass the main mpsc buffer queue, they may
+    /// arrive out of order relative to regular messages.
+    ///
+    /// Returns `true` if the message was queued for sending, `false` if it
+    /// was dropped (channel full or transport shutting down).
+    #[inline]
+    pub fn emit_volatile(&self, msg: impl Into<Str>) -> bool {
+        self.send_volatile(smallvec![Packet::Message(msg.into())])
+    }
+
+    /// Try to send a volatile binary message bypassing the internal buffer channel.
+    /// Volatile messages may be dropped if the transport is not ready to
+    /// receive them.
+    ///
+    /// Returns `true` if the message was queued for sending, `false` if it
+    /// was dropped.
+    #[inline]
+    pub fn emit_binary_volatile<B: Into<Bytes>>(&self, data: B) -> bool {
+        if self.protocol == ProtocolVersion::V3 {
+            self.send_volatile(smallvec![Packet::BinaryV3(data.into())])
+        } else {
+            self.send_volatile(smallvec![Packet::Binary(data.into())])
+        }
+    }
+
+    /// Try to send a volatile message with multiple adjacent binary payloads.
+    /// The message and all binary payloads are sent atomically as a single
+    /// volatile write.
+    ///
+    /// Returns `true` if the message was queued for sending, `false` if it
+    /// was dropped.
+    #[inline]
+    pub fn emit_many_volatile(&self, msg: Str, data: VecDeque<Bytes>) -> bool {
+        let mut packets = SmallVec::with_capacity(1 + data.len());
+        packets.push(Packet::Message(msg));
+        for bin in data {
+            packets.push(Packet::Binary(bin));
+        }
+        self.send_volatile(packets)
+    }
+
+    pub(crate) fn send_volatile(&self, packets: PacketBuf) -> bool {
+        self.volatile_tx.send(Some(packets)).is_ok()
     }
 }
 
@@ -548,6 +608,7 @@ where
     ) -> (Arc<Socket<D>>, tokio::sync::mpsc::Receiver<Packet>) {
         let (internal_tx, internal_rx) = mpsc::channel(buffer_size);
         let (heartbeat_tx, heartbeat_rx) = mpsc::channel(1);
+        let (volatile_tx, volatile_rx) = watch::channel(None);
 
         let sock = Self {
             id: sid,
@@ -555,8 +616,10 @@ where
             transport: AtomicU8::new(TransportType::Websocket as u8),
             upgrading: AtomicBool::new(false),
 
-            internal_rx: Mutex::new(PeekableReceiver::new(internal_rx)),
+            internal_rx: Mutex::new(InternalRx::new(internal_rx, volatile_rx)),
             internal_tx,
+
+            volatile_tx,
 
             heartbeat_rx: Mutex::new(heartbeat_rx),
             heartbeat_tx,
@@ -566,7 +629,6 @@ where
             data: D::default(),
             req_parts: http::Request::<()>::default().into_parts().0,
 
-            #[cfg(feature = "v3")]
             supports_binary: true,
         };
         let sock = Arc::new(sock);
@@ -575,7 +637,7 @@ where
         let sock_clone = sock.clone();
         tokio::spawn(async move {
             let mut internal_rx = sock_clone.internal_rx.try_lock().unwrap();
-            while let Some(packets) = internal_rx.recv().await {
+            while let Some(packets) = internal_rx.buffered_rx.recv().await {
                 for packet in packets {
                     tx.send(packet).await.unwrap();
                 }
