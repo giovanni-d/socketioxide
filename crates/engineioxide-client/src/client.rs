@@ -134,6 +134,16 @@ impl<S: TransportSvc> Client<S> {
         self.open_packet.sid
     }
 
+    /// Returns the open packet the server sent during the handshake.
+    pub fn open_packet(&self) -> &OpenPacket {
+        &self.open_packet
+    }
+
+    /// Returns the instant after which the next poll of the stream yields a heartbeat timeout.
+    pub fn heartbeat_deadline(&self) -> Instant {
+        self.last_ping + self.open_packet.ping_interval + self.open_packet.ping_timeout
+    }
+
     fn should_upgrade(&self) -> bool {
         self.transport() != TransportType::Websocket
             && self
@@ -271,9 +281,7 @@ impl<S: TransportSvc> Client<S> {
     }
 
     fn poll_heartbeat(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ClientError>> {
-        if self.last_ping.elapsed()
-            >= self.open_packet.ping_interval + self.open_packet.ping_timeout
-        {
+        if Instant::now() >= self.heartbeat_deadline() {
             return Poll::Ready(Err(ClientError::heartbeat_timeout()));
         }
 

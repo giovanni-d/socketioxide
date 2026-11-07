@@ -7,6 +7,8 @@
 * [socketioxide-mongodb](./crates/socketioxide-mongodb/CHANGELOG.md)
 * [socketioxide](./crates/socketioxide/CHANGELOG.md)
 * [engineioxide](./crates/engineioxide/CHANGELOG.md)
+* [engineioxide-client](./crates/engineioxide-client/CHANGELOG.md)
+* [socketioxide-client](./crates/socketioxide-client/CHANGELOG.md)
 
 # 0.15.2
 ## socketioxide

@@ -428,6 +428,29 @@ mod test {
         assert_eq!(packet, payload);
     }
 
+    #[test]
+    fn packet_decode_connect_error() {
+        let payload = format!("4{}", json!({ "message": "Invalid namespace" }));
+        let packet = decode(payload);
+        assert_eq!(Packet::connect_error("/", "Invalid namespace"), packet);
+
+        let payload = format!(
+            "4/admin™,{}",
+            json!({ "message": "Not authorized", "data": { "code": 1 } })
+        );
+        let packet = decode(payload);
+        assert_eq!(Packet::connect_error("/admin™", "Not authorized"), packet);
+
+        let packet = decode("4/admin™,\"Not authorized\"".to_string());
+        assert_eq!(Packet::connect_error("/admin™", "Not authorized"), packet);
+
+        let state = ParserState::default();
+        assert!(matches!(
+            decode_str(&state, "4/admin™,{\"code\":1}"),
+            Err(ParseError::InvalidData)
+        ));
+    }
+
     // BinaryEvent(String, BinaryPacket, Option<i64>),
     #[test]
     fn packet_encode_binary_event() {

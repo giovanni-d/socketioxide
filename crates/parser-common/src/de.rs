@@ -42,11 +42,26 @@ pub fn deserialize_packet(data: Str) -> Result<(Packet, Option<usize>), ParseErr
         b'1' => PacketData::Disconnect,
         b'2' => PacketData::Event(str(data), ack),
         b'3' => PacketData::EventAck(str(data), ack.ok_or(ParseError::InvalidPacketType)?),
+        b'4' => PacketData::ConnectError(read_connect_error(&data)?),
         b'5' => PacketData::BinaryEvent(str(data), ack),
         b'6' => PacketData::BinaryAck(str(data), ack.ok_or(ParseError::InvalidPacketType)?),
         _ => return Err(ParseError::InvalidPacketType),
     };
     Ok((Packet { inner, ns }, attachments))
+}
+
+/// Reads the message of a CONNECT_ERROR payload: `{"message": "..."}` (v5) or `"..."` (v4).
+fn read_connect_error(data: &str) -> Result<String, ParseError> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Payload {
+        Object { message: String },
+        Message(String),
+    }
+    match serde_json::from_str(data) {
+        Ok(Payload::Object { message } | Payload::Message(message)) => Ok(message),
+        Err(_) => Err(ParseError::InvalidData),
+    }
 }
 
 fn read_attachments(reader: &mut Cursor<&str>) -> Option<usize> {

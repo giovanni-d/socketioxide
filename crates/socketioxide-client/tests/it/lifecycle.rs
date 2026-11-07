@@ -1,73 +1,253 @@
-//! The lifecycle of a socket over the public API.
+use std::time::{Duration, Instant};
 
-use std::time::Duration;
-
+use serde_json::{Value, json};
 use socketioxide::{
     SocketIo,
-    extract::{AckSender, Data, SocketRef},
+    extract::{AckSender, SocketRef},
+    socket::DisconnectReason as ServerReason,
 };
-use socketioxide_client::{IoManager, errors::SendError};
-use tokio::{sync::mpsc, time};
+use socketioxide_client::{AckError, DisconnectReason, SendError};
+use tokio::sync::mpsc;
 
-/// Wait for `f` to hold, the client connects in the background.
-async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-    let waited = time::timeout(Duration::from_secs(5), async {
-        while !f() {
-            time::sleep(Duration::from_millis(10)).await;
+use crate::fixture::{FakeServer, Server, disconnected, fake_join, join, quiet, within};
+
+fn echo(io: &SocketIo, ns: &'static str, left: Option<mpsc::UnboundedSender<ServerReason>>) {
+    io.ns(ns, async move |socket: SocketRef| {
+        socket.on("query", async |ack: AckSender| {
+            ack.send(&"pong").ok();
+        });
+        socket.on("leave", async |socket: SocketRef| {
+            socket.disconnect().ok();
+        });
+        socket.on("hang", async |socket: SocketRef, _: AckSender| {
+            socket.disconnect().ok();
+        });
+        if let Some(left) = left.clone() {
+            socket.on_disconnect(async move |reason: ServerReason| {
+                left.send(reason).ok();
+            });
         }
-    })
-    .await;
-
-    assert!(waited.is_ok(), "timed out waiting for {what}");
+    });
 }
 
-/// A socket is connected to its namespace, gets the id the server gave it there,
-/// and its events are dispatched both ways. Once it leaves its namespace it
-/// cannot be used anymore, and the next socket gets a connection of its own.
+async fn alive(socket: &socketioxide_client::Socket) {
+    let reply: String = within(socket.emit_with_ack("query", &())).await.unwrap();
+    assert_eq!(reply, "pong");
+}
+
 #[tokio::test]
-async fn a_socket_connects_emits_and_disconnects() {
-    let (svc, server) = SocketIo::new_svc();
-    let io = IoManager::new();
-    let (tx, mut rx) = mpsc::channel::<String>(4);
+async fn heartbeat_keeps_the_connection() {
+    let server = Server::start(
+        SocketIo::builder()
+            .ping_interval(Duration::from_millis(50))
+            .ping_timeout(Duration::from_millis(50)),
+    )
+    .await;
+    echo(&server.io, "/control", None);
+    let client = server.client().await;
+    let (control, mut events) = join(&client, "/control").await;
 
-    server.ns("/", async move |socket: SocketRef| {
-        let tx = tx.clone();
-        socket.on(
-            "hello",
-            async move |Data::<String>(data), ack: AckSender| {
-                ack.send(&data).ok();
-                tx.send(data).await.ok();
-            },
-        );
-    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let socket = io.connect(svc.clone()).await;
+    alive(&control).await;
+    quiet(&mut events).await;
+    let closed = tokio::time::timeout(Duration::from_millis(10), client.closed()).await;
+    assert!(closed.is_err(), "{closed:?}");
+}
 
-    //TODO: thats bad, handle connect frame better.
+#[tokio::test]
+async fn missing_pings_end_the_client() {
+    let fake = FakeServer::bind().await;
+    let (client, mut ws) = fake.client(100, 100).await;
+    let started = Instant::now();
+    let (_control, mut control_events) = fake_join(&client, &mut ws, "/control").await;
+    let (_terminal, mut terminal_events) = fake_join(&client, &mut ws, "/terminal").await;
 
-    // the id comes from the namespace the server accepted it on, it is not the
-    // id of the underlying engine.io connection.
-    eventually("the socket to be connected", || socket.id().is_some()).await;
+    assert_eq!(
+        disconnected(&mut control_events).await,
+        DisconnectReason::PingTimeout
+    );
+    assert_eq!(
+        disconnected(&mut terminal_events).await,
+        DisconnectReason::PingTimeout
+    );
+    assert_eq!(within(client.closed()).await, DisconnectReason::PingTimeout);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    drop(ws);
+}
 
-    // the event reaches the server, and its acknowledgement comes back.
-    let ack = socket
-        .emit_with_ack::<_, String>("hello", "world")
-        .await
-        .expect("the socket should accept the event");
+#[tokio::test]
+async fn server_namespace_disconnect_ends_only_that_socket() {
+    let server = Server::default().await;
+    echo(&server.io, "/control", None);
+    echo(&server.io, "/terminal", None);
+    let client = server.client().await;
+    let (control, mut control_events) = join(&client, "/control").await;
+    let (terminal, mut terminal_events) = join(&client, "/terminal").await;
 
-    assert_eq!(ack.await.unwrap(), "world");
-    assert_eq!(rx.recv().await.as_deref(), Some("world"));
+    terminal.emit("leave", &()).unwrap();
+    assert_eq!(
+        disconnected(&mut terminal_events).await,
+        DisconnectReason::ServerDisconnect
+    );
+    assert!(!terminal.connected());
+    assert!(matches!(
+        terminal.emit("query", &()),
+        Err(SendError::Disconnected)
+    ));
 
-    socket.disconnect().await.unwrap();
+    alive(&control).await;
+    quiet(&mut control_events).await;
 
-    // it left its namespace: it has no id anymore and nothing can be sent.
-    eventually("the socket to be disconnected", || socket.id().is_none()).await;
-    let sent = socket.emit("hello", "again").await;
-    assert!(matches!(sent, Err(SendError::SocketClosed)), "{sent:?}");
+    let (terminal, _events) = join(&client, "/terminal").await;
+    alive(&terminal).await;
+}
 
-    // its connection was released, so this is a new socket on a new connection.
-    let socket2 = io.connect(svc).await;
-    assert!(!std::sync::Arc::ptr_eq(&socket, &socket2));
-    eventually("the new socket to be connected", || socket2.id().is_some()).await;
-    assert_ne!(socket.id(), socket2.id());
+#[tokio::test]
+async fn pending_acks_fail_when_the_socket_ends() {
+    let server = Server::default().await;
+    echo(&server.io, "/control", None);
+    let client = server.client().await;
+    let (control, mut events) = join(&client, "/control").await;
+
+    let pending = within(
+        control
+            .emit_with_ack::<_, Value>("hang", &())
+            .timeout(Duration::from_secs(20)),
+    )
+    .await;
+    assert!(
+        matches!(pending, Err(AckError::Disconnected)),
+        "{pending:?}"
+    );
+    assert_eq!(
+        disconnected(&mut events).await,
+        DisconnectReason::ServerDisconnect
+    );
+}
+
+#[tokio::test]
+async fn pending_acks_fail_when_the_client_ends() {
+    let fake = FakeServer::bind().await;
+    let (client, mut ws) = fake.client(25000, 20000).await;
+    let (control, _events) = fake_join(&client, &mut ws, "/control").await;
+
+    let pending = control
+        .emit_with_ack::<_, Value>("query", &json!(1))
+        .timeout(Duration::from_secs(20));
+    let pending = tokio::spawn(async move { pending.await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(ws);
+
+    let pending = within(pending).await.unwrap();
+    assert!(
+        matches!(pending, Err(AckError::Disconnected)),
+        "{pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn client_namespace_disconnect() {
+    let server = Server::default().await;
+    let (left_tx, mut left) = mpsc::unbounded_channel();
+    echo(&server.io, "/control", Some(left_tx));
+    echo(&server.io, "/terminal", None);
+    let client = server.client().await;
+    let (control, mut control_events) = join(&client, "/control").await;
+    let (terminal, _terminal_events) = join(&client, "/terminal").await;
+
+    control.disconnect().unwrap();
+    assert_eq!(
+        disconnected(&mut control_events).await,
+        DisconnectReason::ClientDisconnect
+    );
+    assert_eq!(
+        within(left.recv()).await.unwrap(),
+        ServerReason::ClientNSDisconnect
+    );
+    assert!(matches!(control.disconnect(), Err(SendError::Disconnected)));
+    alive(&terminal).await;
+}
+
+#[tokio::test]
+async fn server_shutdown_ends_every_socket_once() {
+    let server = Server::default().await;
+    echo(&server.io, "/control", None);
+    echo(&server.io, "/terminal", None);
+    let client = server.client().await;
+    let (_control, mut control_events) = join(&client, "/control").await;
+    let (_terminal, mut terminal_events) = join(&client, "/terminal").await;
+
+    within(server.io.close()).await;
+
+    assert_eq!(
+        disconnected(&mut control_events).await,
+        DisconnectReason::ServerClose
+    );
+    assert_eq!(
+        disconnected(&mut terminal_events).await,
+        DisconnectReason::ServerClose
+    );
+    assert_eq!(within(client.closed()).await, DisconnectReason::ServerClose);
+}
+
+#[tokio::test]
+async fn lost_connection_ends_every_socket_once() {
+    let fake = FakeServer::bind().await;
+    let (client, mut ws) = fake.client(25000, 20000).await;
+    let (control, mut control_events) = fake_join(&client, &mut ws, "/control").await;
+    let (_terminal, mut terminal_events) = fake_join(&client, &mut ws, "/terminal").await;
+
+    drop(ws);
+
+    let lost = |reason: &DisconnectReason| {
+        matches!(
+            reason,
+            DisconnectReason::TransportClose | DisconnectReason::TransportError(_)
+        )
+    };
+    let reason = disconnected(&mut control_events).await;
+    assert!(lost(&reason), "{reason:?}");
+    assert_eq!(disconnected(&mut terminal_events).await, reason);
+    assert_eq!(within(client.closed()).await, reason);
+    assert!(matches!(
+        control.emit("query", &()),
+        Err(SendError::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn client_close_ends_every_socket_once() {
+    let server = Server::default().await;
+    let (left_tx, mut left) = mpsc::unbounded_channel();
+    echo(&server.io, "/control", Some(left_tx));
+    echo(&server.io, "/terminal", None);
+    let client = server.client().await;
+    let (_control, mut control_events) = join(&client, "/control").await;
+    let (_terminal, mut terminal_events) = join(&client, "/terminal").await;
+
+    client.close();
+
+    assert_eq!(
+        disconnected(&mut control_events).await,
+        DisconnectReason::ClientClose
+    );
+    assert_eq!(
+        disconnected(&mut terminal_events).await,
+        DisconnectReason::ClientClose
+    );
+    assert_eq!(within(client.closed()).await, DisconnectReason::ClientClose);
+    within(left.recv()).await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_every_handle_closes_the_websocket() {
+    let server = Server::default().await;
+    let (left_tx, mut left) = mpsc::unbounded_channel();
+    echo(&server.io, "/control", Some(left_tx));
+    let client = server.client().await;
+    let (control, events) = join(&client, "/control").await;
+
+    drop((client, control, events));
+    within(left.recv()).await.unwrap();
 }
